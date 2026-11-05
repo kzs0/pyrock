@@ -21,11 +21,17 @@ __all__ = [
     "block_profile",
     "configure",
     "mutex_profile",
+    "reset",
 ]
 
 
 def configure(*, mutex_sample_fraction: int, block_sample_rate: float) -> None:
     """Set process-wide sampling (0 disables recording)."""
+    raise NotImplementedError
+
+
+def reset() -> None:
+    """Forget every recorded contention (sampling settings are kept)."""
     raise NotImplementedError
 
 

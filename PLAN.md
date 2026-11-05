@@ -264,3 +264,18 @@ These were decided during the phases and are binding for every later phase.
     - `traces_endpoint` accepts either a bare `host:port` or a URL.
     - With a URL, the scheme is stripped and the default port added, the same
       as Go's endpoint normalisation.
+
+### From U3 (metric/log unit tests)
+
+33. **Metric registry and log formatting rules**, as U3's tests pin them down:
+    - **Re-registration:** a different `help` text is *not* a conflict. The
+      first registration wins, as in Go; the docstring will be fixed in
+      Phase 3.
+    - **Counter input:** NaN and negative increments raise `ValueError`,
+      following Python convention (Go ignores them).
+    - **Exposition order:** series are sorted by label values, and labels by
+      name with `le` last.
+    - **JSON log keys** come in this order: `time, level, msg, service`, then
+      static attrs, record attrs, `trace_id`, `span_id`, `logger`.
+      Empty IDs are omitted.
+    - **Runtime metric families** take the registry prefix.

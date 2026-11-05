@@ -22,6 +22,9 @@ modules) from pyrock.
 
 from __future__ import annotations
 
+import socket
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from pyrock._compat import is_positive_number, seconds
@@ -75,6 +78,32 @@ class Config:
             problems.append("addr must be 'host:port'")
         if problems:
             raise ValueError("invalid server Config: " + "; ".join(problems))
+
+
+class _HeaderTooLarge(Exception):
+    """The request line plus headers exceeded ``max_header_bytes`` (answered with 431)."""
+
+
+def _read_head(
+    sock: socket.socket,
+    /,
+    *,
+    timeout: float,
+    max_bytes: int,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[bytes, bytes]:
+    """Read the request line and headers within ``timeout`` seconds **in total**.
+
+    The remaining time is recomputed from ``clock`` before every ``recv``, so a
+    slow drip cannot extend the deadline. Returns ``(head, rest)``: ``head``
+    runs through the terminating blank line (``\r\n\r\n``) and ``rest`` is
+    whatever arrived after it. Returns ``(b"", b"")`` when the peer closes
+    before sending anything. Raises :class:`TimeoutError` when the deadline
+    passes, :class:`_HeaderTooLarge` once more than ``max_bytes`` arrive
+    without a terminator, and :class:`ConnectionError` if the peer closes
+    mid-head.
+    """
+    raise NotImplementedError
 
 
 def metrics_app(registry: Registry, /) -> WSGIApp:

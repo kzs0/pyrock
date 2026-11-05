@@ -183,6 +183,41 @@ class Attrs(Mapping[str, AttrValue]):
         raise NotImplementedError
 
 
+def _normalize_value(value: object, /) -> AttrValue | None:
+    """Return the canonical, export-ready form of a plain attribute value.
+
+    Private seam shared by the OTLP encoders, the log handler and the metric
+    label resolver. ``None`` means "drop this value" (the caller counts it).
+
+    * ``bool`` stays ``bool`` (checked before ``int``);
+    * ``int`` stays ``int`` inside the signed 64-bit range, otherwise it becomes
+      its decimal ``str``;
+    * ``str``, ``float`` and ``bytes`` are returned unchanged;
+    * ``timedelta`` becomes ``float`` milliseconds;
+    * ``datetime`` becomes an RFC 3339 ``str``;
+    * a ``list``/``tuple`` whose items are all ``str``, all ``bool``, all
+      ``int`` or all ``float`` becomes a ``list`` of the normalized items;
+      mixed, nested or other sequences are dropped;
+    * ``BaseException`` returns ``None`` here (callers expand it with
+      :func:`error`);
+    * anything else (``None``, sets, dicts, arbitrary objects) returns ``None``
+      without calling ``str()``/``repr()`` on it.
+    """
+    raise NotImplementedError
+
+
+def _text_value(value: object, /) -> str:
+    """Render a plain attribute value as Prometheus label / log text.
+
+    Private seam. ``str`` as-is; ``bool`` -> ``"true"``/``"false"``; ``int`` ->
+    decimal; ``float`` -> shortest ``repr`` form; ``timedelta`` -> milliseconds
+    with an ``"ms"`` suffix (``"5000ms"``); ``datetime`` -> RFC 3339; ``bytes``
+    -> standard base64. Sequences, exceptions and unsupported values render as
+    :data:`MISSING_LABEL` (``"_"``), never via ``str()``/``repr()``.
+    """
+    raise NotImplementedError
+
+
 def qualified_name(tp: type[BaseException], /) -> str:
     """Return ``module.QualName`` for an exception type (``builtins.ValueError``)."""
     raise NotImplementedError
