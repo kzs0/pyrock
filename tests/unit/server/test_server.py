@@ -374,7 +374,7 @@ def test_keep_alive_serves_several_requests_on_one_connection() -> None:
 def test_pipelined_requests_are_answered_in_order() -> None:
     with running() as srv, socket.create_connection(address(srv), timeout=5) as sock:
         sock.sendall(
-            b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n" b"GET /nope HTTP/1.1\r\nHost: x\r\n\r\n"
+            b"GET /health HTTP/1.1\r\nHost: x\r\n\r\nGET /nope HTTP/1.1\r\nHost: x\r\n\r\n"
         )
         reader = ResponseReader(sock)
         try:

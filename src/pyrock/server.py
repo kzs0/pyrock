@@ -104,233 +104,42 @@ def _read_head(
     terminator (without waiting for more data), and :class:`ConnectionError`
     if the peer closes mid-head.
     """
-    buf = b""
-    deadline = clock() + timeout
-    while True:
-        idx = buf.find(b"\r\n\r\n")
-        if idx >= 0:
-            if idx + 4 > max_bytes:
-                raise _HeaderTooLarge
-            return buf[: idx + 4], buf[idx + 4 :]
-        if len(buf) > max_bytes:
-            raise _HeaderTooLarge
-        remaining = deadline - clock()
-        if remaining <= 0:
-            raise TimeoutError
-        sock.settimeout(remaining)
-        chunk = sock.recv(65536)
-        if not chunk:
-            if not buf:
-                return b"", b""
-            raise ConnectionError("closed mid-head")
-        buf += chunk
+    raise NotImplementedError
 
 
-# --- scratch reference (for test validation only)
-import io as _io
-import threading as _threading
-from pyrock.metric import prometheus as _prom
+def metrics_app(registry: Registry, /) -> WSGIApp:
+    """A WSGI app serving Prometheus text for ``registry`` (500, no body, on ExpositionError)."""
+    raise NotImplementedError
 
-def metrics_app(registry, /):
-    def app(environ, start_response):
-        try:
-            body = _prom.encode(registry)
-        except _prom.ExpositionError:
-            start_response("500 Internal Server Error", [("Content-Type", "text/plain"), ("Content-Length", "0")])
-            return [b""]
-        start_response("200 OK", [("Content-Type", "text/plain; version=0.0.4; charset=utf-8"), ("Content-Length", str(len(body)))])
-        return [body]
-    return app
 
-def health_app():
-    def app(environ, start_response):
-        start_response("200 OK", [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", "3")])
-        return [b"ok\n"]
-    return app
+def health_app() -> WSGIApp:
+    """A WSGI app answering ``200 ok``."""
+    raise NotImplementedError
 
-_REASONS = {200: "OK", 400: "Bad Request", 404: "Not Found", 431: "Request Header Fields Too Large", 500: "Internal Server Error", 503: "Service Unavailable", 505: "HTTP Version Not Supported"}
 
 class Server:
-    def __init__(self, registry, config=None, /):
-        self._registry = registry
-        self._config = config or Config()
-        self._sock = None
-        self._lock = _threading.Lock()
-        self._sem = _threading.BoundedSemaphore(self._config.max_connections)
-        self._conns = {}
-        self._busy = set()
-        self._closed = False
-        self._accept_thread = None
-        self._done = _threading.Event()
-        self._idle_cv = _threading.Condition(self._lock)
-        self._metrics = metrics_app(registry)
-        self._health = health_app()
+    """The observability server (Go: ``server.Server``)."""
+
+    def __init__(self, registry: Registry, config: Config | None = None, /) -> None:
+        raise NotImplementedError
 
     @property
-    def config(self): return self._config
+    def config(self) -> Config:
+        raise NotImplementedError
 
     @property
-    def address(self):
-        if self._sock is None or self._closed: return None
-        return self._sock.getsockname()[:2]
+    def address(self) -> tuple[str, int] | None:
+        """The bound ``(host, port)`` once started, else ``None``."""
+        raise NotImplementedError
 
-    def _bind(self):
-        host, _, port = self._config.addr.rpartition(":")
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind((host, int(port)))
-        except OSError:
-            s.close(); raise
-        s.listen(128)
-        s.settimeout(0.05)
-        self._sock = s
+    def start(self) -> None:
+        """Bind and serve on a daemon thread. ``OSError`` if the address is unavailable."""
+        raise NotImplementedError
 
-    def start(self):
-        self._bind()
-        self._accept_thread = _threading.Thread(target=self._accept_loop, daemon=True)
-        self._accept_thread.start()
+    def serve_forever(self) -> None:
+        """Bind and serve on the calling thread until :meth:`shutdown`."""
+        raise NotImplementedError
 
-    def serve_forever(self):
-        self._bind()
-        self._accept_loop()
-
-    def _accept_loop(self):
-        while not self._closed:
-            try:
-                conn, _ = self._sock.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                break
-            conn.settimeout(None)
-            if not self._sem.acquire(blocking=False):
-                try:
-                    conn.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                except OSError:
-                    pass
-                conn.close()
-                continue
-            t = _threading.Thread(target=self._handle, args=(conn,), daemon=True)
-            with self._lock:
-                self._conns[conn] = t
-            t.start()
-        self._done.set()
-
-    def _respond(self, conn, status, headers, body, close):
-        lines = [f"HTTP/1.1 {status}"] + [f"{k}: {v}" for k, v in headers]
-        if not any(k.lower() == "content-length" for k, _ in headers):
-            lines.append(f"Content-Length: {len(body)}")
-        if close: lines.append("Connection: close")
-        conn.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body)
-
-    def _simple(self, conn, code, close=True):
-        self._respond(conn, f"{code} {_REASONS[code]}", [], b"", close)
-
-    def _handle(self, conn):
-        cfg = self._config
-        rest = b""
-        first = True
-        try:
-            while not self._closed:
-                if not rest:
-                    # wait for the next request (idle) without holding "busy"
-                    conn.settimeout(cfg.read_header_timeout if first else cfg.idle_timeout)
-                    try:
-                        chunk = conn.recv(65536)
-                    except (TimeoutError, OSError):
-                        return
-                    if not chunk: return
-                    rest = chunk
-                with self._lock:
-                    self._busy.add(conn)
-                try:
-                    import socket as _s
-                    # feed buffered bytes through _read_head via a tiny shim
-                    try:
-                        head, rest = _read_head_buf(conn, rest, cfg)
-                    except _HeaderTooLarge:
-                        self._simple(conn, 431); return
-                    except (TimeoutError, ConnectionError, OSError):
-                        return
-                    first = False
-                    lines = head.split(b"\r\n")
-                    parts = lines[0].split(b" ")
-                    if len(parts) != 3 or not parts[2].startswith(b"HTTP/"):
-                        self._simple(conn, 400); return
-                    if parts[2] not in (b"HTTP/1.0", b"HTTP/1.1"):
-                        self._simple(conn, 505); return
-                    method = parts[0].decode("latin-1"); target = parts[1].decode("latin-1")
-                    path, _, query = target.partition("?")
-                    hdrs = {}
-                    for line in lines[1:]:
-                        if not line: continue
-                        k, _, v = line.partition(b":")
-                        hdrs[k.strip().lower().decode("latin-1")] = v.strip().decode("latin-1")
-                    close = hdrs.get("connection", "").lower() == "close" or parts[2] == b"HTTP/1.0"
-                    app = None
-                    if path == "/metrics" and cfg.metrics: app = self._metrics
-                    elif path in ("/health", "/ready"): app = self._health
-                    elif cfg.pprof and cfg.profile_handler is not None and path.startswith("/debug/pprof/"): app = cfg.profile_handler
-                    if app is None:
-                        self._simple(conn, 404, close); 
-                        if close: return
-                        continue
-                    environ = {"REQUEST_METHOD": method, "PATH_INFO": path, "QUERY_STRING": query, "SCRIPT_NAME": "", "SERVER_PROTOCOL": parts[2].decode(), "wsgi.input": _io.BytesIO(b""), "wsgi.errors": _io.StringIO(), "wsgi.url_scheme": "http", "wsgi.version": (1, 0), "wsgi.multithread": True, "wsgi.multiprocess": False, "wsgi.run_once": False, "SERVER_NAME": "x", "SERVER_PORT": "0"}
-                    state = {}
-                    def start_response(status, headers, exc_info=None):
-                        state["s"] = status; state["h"] = headers
-                        return lambda b: None
-                    try:
-                        body = b"".join(app(environ, start_response))
-                    except Exception:
-                        self._simple(conn, 500, close)
-                        if close: return
-                        continue
-                    self._respond(conn, state["s"], state["h"], body, close)
-                    if close: return
-                finally:
-                    with self._lock:
-                        self._busy.discard(conn)
-                        self._idle_cv.notify_all()
-        finally:
-            try: conn.close()
-            except OSError: pass
-            with self._lock:
-                self._conns.pop(conn, None)
-                self._idle_cv.notify_all()
-            self._sem.release()
-
-    def shutdown(self, *, timeout=None):
-        if self._sock is None or self._closed:
-            self._closed = True
-            return
-        self._closed = True
-        self._sock.close()
-        if self._accept_thread is not None: self._accept_thread.join(5)
-        timeout = self._config.shutdown_timeout if timeout is None else timeout
-        import time as _t
-        deadline = _t.monotonic() + timeout
-        with self._lock:
-            for c in list(self._conns):
-                if c not in self._busy:
-                    try: c.shutdown(socket.SHUT_RDWR)
-                    except OSError: pass
-            while self._busy:
-                rem = deadline - _t.monotonic()
-                if rem <= 0: break
-                self._idle_cv.wait(rem)
-            for c in list(self._conns):
-                try: c.shutdown(socket.SHUT_RDWR)
-                except OSError: pass
-
-def _read_head_buf(conn, buf, cfg):
-    class _S:
-        def __init__(self): self.pending = buf
-        def settimeout(self, t): conn.settimeout(t)
-        def recv(self, n):
-            if self.pending:
-                p, self.pending = self.pending, b""
-                return p
-            return conn.recv(n)
-    return _read_head(_S(), timeout=cfg.read_header_timeout, max_bytes=cfg.max_header_bytes)
+    def shutdown(self, *, timeout: float | None = None) -> None:
+        """Stop accepting, wait for in-flight requests up to ``timeout``, close (idempotent)."""
+        raise NotImplementedError

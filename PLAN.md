@@ -316,3 +316,15 @@ These were decided during the phases and are binding for every later phase.
       - `H2Error` wraps connect failures and timeouts.
     - **Span lifecycle:** spans ignore mutation after `end()`. Unsampled spans
       never reach the processor.
+
+### From U4 (profile/server unit tests)
+
+36. **U4's tested behaviours are accepted** as written in
+    `tests/unit/{profile,server}`. Open points, decided:
+    - **Heap frames:** frames are identified by (filename, line). The function
+      name is resolved from code objects when possible, otherwise `file:line`.
+    - **`ProfileExportConfig` limits:** following Go, `retries` must be 0–3
+      and `max_bytes` at most 32 MiB. Validation is added in Phase 3 together
+      with unit tests.
+    - **Compat profile tests:** these only check fields shared between
+      v0.2.0 and the newer schema, so `opentelemetry-proto` is not pinned.

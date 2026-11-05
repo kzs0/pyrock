@@ -148,87 +148,28 @@ class ProfileExportStats:
     skipped: int = 0
 
 
-# --- scratch reference
-import threading as _threading
-import time as _time
-import urllib.error as _ue
-import urllib.request as _ur
-
-
-class _NoRedirect(_ur.HTTPRedirectHandler):
-    def redirect_request(self, *a, **k):
-        return None
-
-
 class ProfileExporter:
-    def __init__(self, config, service, resource, policy):
-        from pyrock.profile import _heap, _locks, _sampler
-        self._cfg, self._service, self._resource = config, service, dict(resource or {})
-        self._stop = _threading.Event()
-        self._lock = _threading.Lock()
-        self._stats = [0, 0, 0]
-        self._heap = _heap.HeapProfiler() if ProfileType.HEAP in config.types else None
-        if self._heap: self._heap.start()
-        _locks.configure(mutex_sample_fraction=config.mutex_sample_fraction, block_sample_rate=config.block_sample_rate)
-        self._opener = _ur.build_opener(_NoRedirect)
-        self._thread = _threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+    """A running exporter: collects on ``interval`` and POSTs OTLP profiles."""
 
-    def _bump(self, i):
-        with self._lock: self._stats[i] += 1
+    def stats(self) -> ProfileExportStats:
+        raise NotImplementedError
 
-    def stats(self):
-        with self._lock: return ProfileExportStats(*self._stats)
+    def stop(self, *, timeout: float | None = None) -> None:
+        """Stop collection (idempotent); never stops a profiler someone else owns."""
+        raise NotImplementedError
 
     @property
-    def running(self): return self._thread.is_alive() and not self._stop.is_set()
-
-    def stop(self, *, timeout=None):
-        self._stop.set()
-        self._thread.join(timeout)
-        if self._heap: self._heap.stop(); self._heap = None
-
-    def _run(self):
-        while not self._stop.is_set():
-            for t in self._cfg.types:
-                if self._stop.is_set(): return
-                self._one(t)
-            if self._stop.wait(self._cfg.interval): return
-
-    def _collect(self, t):
-        from pyrock.profile import _locks, _sampler, _stacks
-        if t in (ProfileType.CPU, ProfileType.WALL):
-            p = _sampler.SamplingProfiler(hz=self._cfg.sample_hz, cpu=t is ProfileType.CPU, sleep=lambda s: self._stop.wait(s))
-            return p.collect(self._cfg.cpu_sample_duration)
-        if t is ProfileType.HEAP: return self._heap.snapshot()
-        if t is ProfileType.THREADS: return _stacks.thread_profile()
-        if t is ProfileType.MUTEX:
-            return None if self._cfg.mutex_sample_fraction == 0 else _locks.mutex_profile()
-        return None if self._cfg.block_sample_rate == 0 else _locks.block_profile()
-
-    def _one(self, t):
-        from pyrock.profile import _otlp
-        prof = self._collect(t)
-        if self._stop.is_set(): return
-        if prof is None: self._bump(2); return
-        try:
-            data = _otlp.encode_export_request(prof, service=self._service, profile_type=t.value, resource=self._resource, max_bytes=self._cfg.max_bytes)
-        except ValueError:
-            self._bump(1); return
-        for attempt in range(self._cfg.retries + 1):
-            if attempt and self._stop.wait(0.1 * attempt): return
-            req = _ur.Request(self._cfg.endpoint, data=data, method="POST", headers={**self._cfg.headers, "Content-Type": "application/x-protobuf", "x-profile-type": t.value})
-            try:
-                with self._opener.open(req, timeout=self._cfg.timeout) as resp:
-                    resp.read()
-                self._bump(0); return
-            except _ue.HTTPError as e:
-                if (e.code == 429 or e.code >= 500) and attempt < self._cfg.retries: continue
-                self._bump(1); return
-            except OSError:
-                if attempt < self._cfg.retries: continue
-                self._bump(1); return
+    def running(self) -> bool:
+        raise NotImplementedError
 
 
-def start_export(config, /, *, service, resource=None, policy=None):
-    return ProfileExporter(config, service, resource, policy)
+def start_export(
+    config: ProfileExportConfig,
+    /,
+    *,
+    service: str,
+    resource: Mapping[str, AttrValue] | None = None,
+    policy: Policy | None = None,
+) -> ProfileExporter:
+    """Start a background exporter thread for ``config``."""
+    raise NotImplementedError

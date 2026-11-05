@@ -277,7 +277,7 @@ def decode_any_value(raw: bytes) -> Any:
     if 5 in g:
         return [decode_any_value(v) for v in messages(group(scalar(g, 5)), 1)]
     if 6 in g:
-        return {k: v for k, v in (decode_key_value(kv) for kv in messages(group(scalar(g, 6)), 1))}
+        return dict(decode_key_value(kv) for kv in messages(group(scalar(g, 6)), 1))
     if 7 in g:
         return bytes(scalar(g, 7))
     return None

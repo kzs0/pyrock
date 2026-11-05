@@ -19,7 +19,6 @@ from pyrock.profile._pprof import Frame, Sample, SampleType, encode, encode_gzip
 from tests.unit.profile._helpers import (
     DURATION_NS,
     LEAF,
-    LEAF_OTHER_LINE,
     MID,
     ROOT,
     START_NS,
@@ -195,7 +194,7 @@ def test_go_tool_pprof_reads_the_output(tmp_path: os.PathLike[str]) -> None:
         fh.write(encode_gzip(make_profile()))
     env = {**os.environ, "GOTOOLCHAIN": "local", "GOFLAGS": ""}
     result = subprocess.run(
-        ["go", "tool", "pprof", "-raw", path],  # noqa: S607
+        ["go", "tool", "pprof", "-raw", path],
         capture_output=True,
         text=True,
         timeout=120,

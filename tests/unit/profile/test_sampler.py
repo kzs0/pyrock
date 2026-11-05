@@ -82,7 +82,7 @@ def make_threads() -> Iterator[Callable[[str], threading.Thread]]:
         release = threading.Event()
         code = f"def {name}(release):\n    release.wait(10)\n"
         namespace: dict[str, object] = {}
-        exec(code, namespace)  # noqa: S102 - a uniquely named function for stack matching
+        exec(code, namespace)
         thread = threading.Thread(target=namespace[name], args=(release,), daemon=True)
         thread.start()
         releases.append(release)

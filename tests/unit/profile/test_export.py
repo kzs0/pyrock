@@ -498,7 +498,9 @@ def test_stop_leaves_no_threads(
 def test_empty_types_upload_nothing(
     otlp_collector: OTLPHTTPCollector, exporters: list[ProfileExporter]
 ) -> None:
-    exporter = export(exporters, config(otlp_collector, types=(), interval=0.1, cpu_sample_duration=0.05))
+    exporter = export(
+        exporters, config(otlp_collector, types=(), interval=0.1, cpu_sample_duration=0.05)
+    )
     threading.Event().wait(0.4)
     exporter.stop(timeout=5)
     assert otlp_collector.profile_requests() == []

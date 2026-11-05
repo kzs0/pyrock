@@ -123,9 +123,7 @@ def test_method_check_happens_before_collection() -> None:
 # ---------------------------------------------------------------- seconds
 
 
-@pytest.mark.parametrize(
-    "seconds", ["31", "30.5", "0", "-1", "abc", "nan", "inf", "1e9", "5s"]
-)
+@pytest.mark.parametrize("seconds", ["31", "30.5", "0", "-1", "abc", "nan", "inf", "1e9", "5s"])
 def test_invalid_seconds_are_400(seconds: str) -> None:
     started = time.monotonic()
     resp = get(f"/debug/pprof/profile?seconds={seconds}")
