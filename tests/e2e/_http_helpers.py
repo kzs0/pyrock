@@ -19,7 +19,9 @@ import contextlib
 import contextvars
 import http.client
 import http.server
+import inspect
 import socket
+import socketserver
 import threading
 import wsgiref.simple_server
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -111,6 +113,59 @@ def serve_handler(handler_class: type[http.server.BaseHTTPRequestHandler]) -> It
         thread.join(5)
 
 
+class ThreadingWSGIServer(socketserver.ThreadingMixIn, wsgiref.simple_server.WSGIServer):
+    """``wsgiref`` with a thread per request; worker threads are joined on close."""
+
+    daemon_threads = False
+    block_on_close = True
+
+
+class JoiningThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    daemon_threads = False
+    block_on_close = True
+
+
+@contextlib.contextmanager
+def serve_threaded(
+    app: Callable[..., Iterable[bytes]] | None = None,
+    *,
+    handler_class: type[http.server.BaseHTTPRequestHandler] | None = None,
+) -> Iterator[str]:
+    """Serve a WSGI ``app`` or a handler class on a *threaded* server.
+
+    Unlike :func:`serve_wsgi`, nothing copies the caller's context: the serve
+    loop runs on a plain ``threading.Thread`` and every request on a fresh
+    worker thread, as in production. Leaving the block joins the workers.
+    """
+    httpd: socketserver.TCPServer
+    if app is not None:
+        httpd = wsgiref.simple_server.make_server(
+            "127.0.0.1",
+            0,
+            app,
+            server_class=ThreadingWSGIServer,
+            handler_class=_QuietWSGIHandler,
+        )
+    else:
+        assert handler_class is not None
+        httpd = JoiningThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+    thread = threading.Thread(
+        target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(5)
+
+
+def require_param(fn: Callable[..., Any], name: str) -> None:
+    """Fail with an assertion (not a ``TypeError``) when ``fn`` lacks keyword ``name``."""
+    assert name in inspect.signature(fn).parameters, f"{fn!r} has no {name}= parameter"
+
+
 def free_port() -> int:
     """A port that nothing listens on (bound then released)."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -197,6 +252,11 @@ class Result:
 class WSGIFlavor:
     name = "wsgi"
 
+    def middleware_class(self) -> Any:
+        from pyrock.wsgi import Middleware
+
+        return Middleware
+
     def middleware(self, app: Any, **kwargs: Any) -> Any:
         from pyrock.wsgi import Middleware
 
@@ -234,6 +294,11 @@ class WSGIFlavor:
 
 class ASGIFlavor:
     name = "asgi"
+
+    def middleware_class(self) -> Any:
+        from pyrock.asgi import Middleware
+
+        return Middleware
 
     def middleware(self, app: Any, **kwargs: Any) -> Any:
         from pyrock.asgi import Middleware
@@ -347,9 +412,9 @@ class MiddlewareContract:
         assert "http.user_agent" not in attrs
         assert USER_AGENT not in attr_strings(t.spans.one(name="http.request"))
 
-    def test_user_agent_present_when_policy_allows_it(self) -> None:
-        # Assumed opt-in: an attribute allowlist naming the http.* group.
-        policy = privacy.Policy(attribute_keys=["http.*"])
+    @pytest.mark.parametrize("allow", [["http.user_agent"], ["http.*"]])
+    def test_user_agent_present_when_policy_allows_it(self, allow: list[str]) -> None:
+        policy = privacy.Policy(attribute_keys=allow)
         with capture(data_policy=policy) as t:
             self._serve()
         assert t.spans.one(name="http.request").attrs["http.user_agent"] == USER_AGENT
@@ -553,6 +618,30 @@ class MiddlewareContract:
             prom = parse(t.metrics.text())
         assert t.spans.one(name="http.request").attrs["http.route"] == "/orders/{order_id}"
         assert prom.value("http_request_count", http_route="/orders/{order_id}") == 1
+
+    def test_route_callable_returning_none_falls_back_to_framework_key(self) -> None:
+        with capture() as t:
+            self._serve(Reply(route="/from/framework"), route=lambda _req: None)
+        assert t.spans.one(name="http.request").attrs["http.route"] == "/from/framework"
+
+    def test_route_callable_returning_none_without_key_is_underscore(self) -> None:
+        with capture() as t:
+            self._serve(path="/users/42", route=lambda _req: None)
+        assert t.spans.one(name="http.request").attrs["http.route"] == "_"
+
+    def test_middleware_built_before_init_resolves_instance_per_request(self) -> None:
+        app = self.flavor.middleware(self.flavor.app(Reply()))
+        with capture() as t:
+            self.flavor.call(app, "GET", "/", default_headers())
+        assert t.spans.one(name="http.request").kind is SpanKind.SERVER
+
+    def test_explicit_bedrock_wins_over_active_instance(self) -> None:
+        require_param(self.flavor.middleware_class(), "bedrock")
+        with capture() as outer:
+            with capture() as inner:
+                self._serve(bedrock=outer.bedrock)
+            assert len(inner.spans) == 0
+        assert outer.spans.one(name="http.request").kind is SpanKind.SERVER
 
     def test_route_callable_wins_over_framework_key(self) -> None:
         with capture() as t:

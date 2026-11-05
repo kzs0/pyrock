@@ -234,3 +234,26 @@ These were decided during the phases and are binding for every later phase.
     - spans are complete after the block exits;
     - `metrics.text()` works inside the block;
     - `spans.find(kind=...)` filters by kind.
+
+### From E3 (export e2e)
+
+22. **The detection env var is `BEDROCK_DISABLE_ENVIRONMENT_DETECTION`**, the
+    Go name.
+23. **Cloud trace retry:** one initial attempt plus up to 3 retries (4 calls in
+    all), with backoff `(1, 2, 4)` seconds, as in Go.
+24. **`CloudConfig.retry_backoff`**, a `tuple[float, ...]` defaulting to
+    `(1.0, 2.0, 4.0)`, is public and validated (non-negative, at most 10
+    entries). Its length is the number of retries.
+25. **`CloudConfig.traces_endpoint`**, a `str | None` defaulting to `None`,
+    optionally overrides the gRPC trace target. Without it, traces derive
+    their target from `endpoint`.
+26. **Samplers follow DESIGN, not Go:**
+    - `ParentBased` drops spans whose parent is unsampled.
+    - `Ratio` is deterministic on the trace ID.
+    - The differences from Go are documented in the README.
+27. **The debug profile's `seconds`** above 30 is rejected with `400`, as in
+    Go. The DESIGN text saying "capped" is changed to match.
+28. **Exposition numbers** follow Go's `%g` formatting.
+29. **The OTLP scope** is name `pyrock` plus the package version.
+30. **HEAP stops tracemalloc** on export stop only if pyrock started it.
+    Profile uploads carry `x-profile-type`.

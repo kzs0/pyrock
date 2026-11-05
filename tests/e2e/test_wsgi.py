@@ -27,6 +27,8 @@ from tests.e2e._http_helpers import (
     MiddlewareContract,
     WSGIFlavor,
     default_headers,
+    require_param,
+    serve_threaded,
     serve_wsgi,
 )
 from tests.support.wsgi_driver import call_wsgi
@@ -155,7 +157,9 @@ def test_iterable_close_is_called_when_iteration_raises() -> None:
     with capture() as t, pytest.raises(ValueError, match="stream broke"):
         call_wsgi(Middleware(app), "GET", "/", headers=default_headers())
     assert body.closed == 1
-    assert t.spans.one(name="http.request").failed
+    span = t.spans.one(name="http.request")
+    assert span.failed
+    assert span.attrs["http.status_code"] == 200  # the status already sent
 
 
 def test_iterable_close_is_called_when_client_disconnects_early() -> None:
@@ -247,3 +251,40 @@ def test_real_server_continues_incoming_traceparent() -> None:
         with urllib.request.urlopen(req, timeout=5) as resp:
             resp.read()
     assert t.spans.one(name="http.request").trace_id == TRACE_ID
+
+
+def test_threaded_server_requests_are_instrumented_without_context_copy() -> None:
+    seen: list[Any] = []
+
+    def app(environ: dict[str, Any], start_response: Any) -> list[bytes]:
+        seen.append(pyrock.current_operation())
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"threaded"]
+
+    with capture() as t:
+        middleware = Middleware(app)  # captures the active instance
+        with serve_threaded(middleware) as base:
+            for _ in range(2):
+                with urllib.request.urlopen(base + "/", timeout=5) as resp:
+                    assert resp.read() == b"threaded"
+    spans = t.spans.find(name="http.request")
+    assert len(spans) == 2
+    assert all(s.kind is SpanKind.SERVER for s in spans)
+    assert [op is not None for op in seen] == [True, True]
+    assert sorted(op.span_id for op in seen) == sorted(s.span_id for s in spans)
+
+
+def test_threaded_server_uses_explicit_bedrock() -> None:
+    require_param(Middleware, "bedrock")
+
+    def app(environ: dict[str, Any], start_response: Any) -> list[bytes]:
+        start_response("200 OK", [])
+        return [b""]
+
+    with capture() as outer:
+        with capture() as inner:
+            middleware = Middleware(app, bedrock=outer.bedrock)
+            with serve_threaded(middleware) as base:
+                urllib.request.urlopen(base + "/", timeout=5).close()
+        assert len(inner.spans) == 0
+    assert len(outer.spans.find(name="http.request")) == 1
