@@ -199,3 +199,38 @@ These were decided during the phases and are binding for every later phase.
    keys, in addition to `**kwargs`.
 10. **`pyrock.Thread`** accepts `context=`, with the same meaning as on 3.14's
     `threading.Thread`.
+
+### From E2 (HTTP e2e)
+
+11. **`http.user_agent`** is sensitive and emitted only when the policy's
+    `attribute_keys` allowlist matches it (`"http.user_agent"` or `"http.*"`).
+12. **`raise_for_status=True`** raises `urllib.error.HTTPError`.
+13. **Raw outgoing paths and URLs** (`http.target`, `http.url`) are emitted
+    only when allowlisted in `attribute_keys`. Credentials, query and fragment
+    are always stripped. Userinfo is never turned into auth.
+14. **ASGI `websocket=True`** gives one SERVER operation named `http.websocket`
+    (overridable), with `http.route` and `http.scheme` (`ws`/`wss`). It ends
+    when the connection closes.
+15. **Connection cap:** a rejected connection gets `503` and is then closed.
+    `pyrock.Config.server_max_connections` (env
+    `BEDROCK_SERVER_MAX_CONNECTIONS`, default 64) maps to the server config.
+16. **The profile handler** receives `/debug/pprof/*` with `PATH_INFO`
+    unchanged.
+17. **An exception after headers are sent** marks failure. `http.status_code`
+    stays the status already sent, and the exception is re-raised.
+18. **Middleware and threaded servers.** There is **no** process-wide default
+    instance, so a plain `threading.Thread` still sees the noop.
+    `wsgi.Middleware`, `asgi.Middleware` and `http.instrument_http_server`
+    capture the instance when they are constructed: either `bedrock=` or
+    `pyrock.current()` at that point. If that is the noop, they resolve
+    `current()` per request instead. Each request is handled inside a context
+    with that instance active, so handler code on server worker threads is
+    instrumented.
+19. **A `route=` callable returning `None`** falls back to the framework
+    route key, then to `"_"`.
+20. **Metric family names** turn dots into underscores (`http.request` →
+    `http_request_count`).
+21. **`testing.capture`:**
+    - spans are complete after the block exits;
+    - `metrics.text()` works inside the block;
+    - `spans.find(kind=...)` filters by kind.

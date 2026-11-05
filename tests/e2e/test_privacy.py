@@ -67,7 +67,7 @@ def logger_name() -> str:
 
 def test_error_message_dropped_by_default(otlp_collector: OTLPHTTPCollector) -> None:
     with (
-        pytest.raises(ValueError, match="boom|secret"),
+        pytest.raises(ValueError, match=r"boom|secret"),
         running(trace_url=otlp_collector.traces_url) as b,
         b.operation("failing"),
     ):
@@ -79,7 +79,7 @@ def test_error_message_dropped_by_default(otlp_collector: OTLPHTTPCollector) -> 
 
 def test_error_message_kept_with_allow_error_details(otlp_collector: OTLPHTTPCollector) -> None:
     with (
-        pytest.raises(ValueError, match="boom|secret"),
+        pytest.raises(ValueError, match=r"boom|secret"),
         running(
             trace_url=otlp_collector.traces_url,
             data_policy=_policy(allow_error_details=True),
