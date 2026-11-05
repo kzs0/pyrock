@@ -35,6 +35,22 @@ def _cloud(endpoint: str, **kw: Any) -> Any:
     return pyrock.cloud(API_KEY, **options)
 
 
+def _fast_retry_cloud(endpoint: str, **kw: Any) -> Any:
+    """A CloudConfig with tiny retry back-off so retry tests stay fast."""
+    import pyrock
+
+    options: dict[str, Any] = {
+        "api_key": API_KEY,
+        "endpoint": endpoint,
+        "insecure": True,
+        "push_interval": 60.0,
+        "profiles": (),
+        "retry_backoff": (0.01, 0.02, 0.04),
+    }
+    options.update(kw)
+    return pyrock.CloudConfig(**options)
+
+
 def _grpc_endpoint(collector: GRPCCollector) -> str:
     return f"http://{collector.endpoint}"
 
@@ -93,6 +109,39 @@ def test_cloud_rejects_api_key_with_newline() -> None:
 
     with pytest.raises(ValueError, match="api_key"):
         pyrock.cloud("brk\r\nX-Injected: 1")
+
+
+def test_retry_backoff_defaults_match_go() -> None:
+    import pyrock
+
+    assert pyrock.cloud(API_KEY).retry_backoff == (1.0, 2.0, 4.0)
+
+
+def test_retry_backoff_rejects_negative_values() -> None:
+    import pyrock
+
+    with pytest.raises(ValueError, match="retry_backoff"):
+        pyrock.CloudConfig(api_key=API_KEY, retry_backoff=(1.0, -0.5))
+
+
+def test_retry_backoff_rejects_too_many_entries() -> None:
+    import pyrock
+
+    with pytest.raises(ValueError, match="retry_backoff"):
+        pyrock.CloudConfig(api_key=API_KEY, retry_backoff=(0.1,) * 11)
+
+
+def test_retry_backoff_accepts_ten_entries() -> None:
+    import pyrock
+
+    cfg = pyrock.CloudConfig(api_key=API_KEY, retry_backoff=[0.1] * 10)
+    assert cfg.retry_backoff == (0.1,) * 10
+
+
+def test_traces_endpoint_defaults_to_none() -> None:
+    import pyrock
+
+    assert pyrock.cloud(API_KEY).traces_endpoint is None
 
 
 # ------------------------------------------------------------------ metrics push
@@ -197,34 +246,52 @@ def test_cloud_traces_carry_service_name(grpc_collector: GRPCCollector) -> None:
 
 
 @pytest.mark.compat
-@pytest.mark.slow
 def test_cloud_trace_export_retries_with_backoff(grpc_collector: GRPCCollector) -> None:
     grpc_collector.fail_next(2, code="UNAVAILABLE")
-    b = start(cloud=_cloud(_grpc_endpoint(grpc_collector)))
+    cloud = _fast_retry_cloud(_grpc_endpoint(grpc_collector), retry_backoff=(0.2, 0.4, 0.8))
+    b = start(cloud=cloud)
     with b.operation("retried"):
         pass
     started = time.monotonic()
-    b.shutdown(timeout=20)
+    b.shutdown(timeout=10)
     elapsed = time.monotonic() - started
-    assert grpc_collector.wait_for_calls(3) == 3
     assert len(grpc_collector.requests) == 3
-    # Back-off of 1 s then 2 s between the three attempts.
-    assert elapsed >= 2.5
+    # Back-off of 0.2 s then 0.4 s between the three calls.
+    assert elapsed >= 0.5
     assert b.trace_export_stats().exported == 1
 
 
 @pytest.mark.compat
-@pytest.mark.slow
 def test_cloud_trace_export_gives_up_after_retries(grpc_collector: GRPCCollector) -> None:
     grpc_collector.fail_next(10, code="UNAVAILABLE")
-    b = start(cloud=_cloud(_grpc_endpoint(grpc_collector)))
+    b = start(cloud=_fast_retry_cloud(_grpc_endpoint(grpc_collector)))
     with b.operation("doomed"):
         pass
-    b.shutdown(timeout=20)
-    calls = len(grpc_collector.requests)
-    assert 3 <= calls <= 4  # pyrock: 3 attempts; Go: 1 + 3 retries
+    b.shutdown(timeout=10)
+    assert len(grpc_collector.requests) == 4  # 1 attempt + 3 retries, as in Go
     assert b.trace_export_stats().failed >= 1
     assert b.trace_export_stats().exported == 0
+
+
+@pytest.mark.compat
+def test_retry_backoff_length_sets_retry_count(grpc_collector: GRPCCollector) -> None:
+    grpc_collector.fail_next(10, code="UNAVAILABLE")
+    cloud = _fast_retry_cloud(_grpc_endpoint(grpc_collector), retry_backoff=(0.01,))
+    b = start(cloud=cloud)
+    with b.operation("once_retried"):
+        pass
+    b.shutdown(timeout=10)
+    assert len(grpc_collector.requests) == 2
+
+
+@pytest.mark.compat
+def test_empty_retry_backoff_disables_retries(grpc_collector: GRPCCollector) -> None:
+    grpc_collector.fail_next(10, code="UNAVAILABLE")
+    b = start(cloud=_fast_retry_cloud(_grpc_endpoint(grpc_collector), retry_backoff=()))
+    with b.operation("no_retry"):
+        pass
+    b.shutdown(timeout=10)
+    assert len(grpc_collector.requests) == 1
 
 
 @pytest.mark.compat
@@ -357,3 +424,30 @@ def test_cloud_workers_are_daemon_threads(push_sink: MetricsPushSink) -> None:
         started = set(threading.enumerate()) - before
         assert started
         assert all(t.daemon for t in started)
+
+
+@pytest.mark.compat
+def test_traces_endpoint_splits_traces_from_pushes(
+    grpc_collector: GRPCCollector, push_sink: MetricsPushSink
+) -> None:
+    from pyrock.profile import ProfileType
+
+    cloud = _fast_retry_cloud(
+        push_sink.endpoint,
+        traces_endpoint=grpc_collector.endpoint,
+        push_interval=0.1,
+        profile_interval=0.3,
+        profile_cpu_sample_duration=0.1,
+        profiles=(ProfileType.HEAP,),
+    )
+    with running(cloud=cloud) as b:
+        b.counter("combined_total", "C").inc()
+        with b.operation("combined"):
+            pass
+        push_sink.wait_for_pushes(1)
+        push_sink.wait_for_profiles(1)
+    assert [s["name"] for s in grpc_collector.wait_for_spans(1)] == ["combined"]
+    assert grpc_collector.metadata[0]["x-bedrock-key"] == API_KEY
+    assert push_sink.pushes()[0].header("authorization") == f"Bearer {API_KEY}"
+    assert push_sink.profile_requests()[0].header("authorization") == f"Bearer {API_KEY}"
+    assert push_sink.trace_requests() == []

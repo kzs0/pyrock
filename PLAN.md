@@ -257,3 +257,5 @@ These were decided during the phases and are binding for every later phase.
 29. **The OTLP scope** is name `pyrock` plus the package version.
 30. **HEAP stops tracemalloc** on export stop only if pyrock started it.
     Profile uploads carry `x-profile-type`.
+31. **Nested `capture()` / `with init()` blocks** restore the outer active
+    instance when they exit. This is the same rule as decision 2.

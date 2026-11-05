@@ -433,13 +433,16 @@ def test_debug_cpu_profile_returns_gzipped_pprof(busy_thread: threading.Thread) 
     assert b"_busy_spin_for_cpu_profile" in raw
 
 
-def test_debug_profile_seconds_is_capped() -> None:
+def test_debug_profile_seconds_above_cap_is_rejected() -> None:
     started = time.monotonic()
-    resp = call_wsgi(_debug_app(max_seconds=0.3), "GET", "/debug/pprof/profile?seconds=10")
-    elapsed = time.monotonic() - started
-    # Either clamped to the cap (200) or rejected outright like Go (400); never 10 s.
-    assert resp.status_code in {200, 400}
-    assert elapsed < 3.0
+    resp = call_wsgi(_debug_app(), "GET", "/debug/pprof/profile?seconds=31")
+    assert resp.status_code == 400
+    assert time.monotonic() - started < 3.0
+
+
+def test_debug_profile_invalid_seconds_is_rejected() -> None:
+    resp = call_wsgi(_debug_app(), "GET", "/debug/pprof/profile?seconds=abc")
+    assert resp.status_code == 400
 
 
 def test_debug_handler_rejects_post() -> None:

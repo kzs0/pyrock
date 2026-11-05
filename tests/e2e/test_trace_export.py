@@ -51,9 +51,12 @@ def test_resource_carries_service_name(otlp_collector: OTLPHTTPCollector) -> Non
     assert span["resource"]["service.name"] == "users-api"
 
 
-def test_scope_name_is_set(otlp_collector: OTLPHTTPCollector) -> None:
+def test_scope_is_pyrock_with_version(otlp_collector: OTLPHTTPCollector) -> None:
+    import pyrock
+
     span = export_one(otlp_collector)
-    assert span["scope_name"]
+    assert span["scope_name"] == "pyrock"
+    assert span["scope_version"] == pyrock.__version__
 
 
 def test_span_ids_are_lowercase_hex(otlp_collector: OTLPHTTPCollector) -> None:
