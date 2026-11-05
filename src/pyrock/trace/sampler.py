@@ -1,7 +1,12 @@
 """Samplers. As in Go, sampling controls export, not span creation.
 
-``Ratio`` is deterministic on the low 8 bytes of the trace ID (the same rule as
-Go), so mixed-language traces make the same decision.
+These samplers follow DESIGN.md, which deliberately differs from Go:
+
+* ``Ratio`` is deterministic on the low 8 bytes of the trace ID, so every
+  service sees the same decision for a trace (Go's ``RatioSampler`` draws a
+  random number per span).
+* ``ParentBased`` drops spans whose parent is unsampled (Go consults the root
+  sampler when the parent is unsampled).
 
 .. code-block:: python
 
@@ -88,7 +93,8 @@ class AlwaysOff:
 class Ratio:
     """Samples ``ratio`` of traces, deterministically on the trace ID (Go: ``RatioSampler``).
 
-    ``ratio`` must be in ``[0, 1]``; ``ValueError`` otherwise.
+    Unlike Go (random per span), the decision depends only on the trace ID's
+    low 8 bytes. ``ratio`` must be in ``[0, 1]``; ``ValueError`` otherwise.
     """
 
     def __init__(self, ratio: float, /) -> None:
@@ -105,7 +111,12 @@ class Ratio:
 
 
 class ParentBased:
-    """Follows the parent's decision; uses ``root`` for root spans (the default sampler)."""
+    """Follows the parent's decision; uses ``root`` for root spans (the default sampler).
+
+    A sampled parent gives a sampled child and an unsampled parent an
+    unsampled (dropped) child. Go instead consults ``root`` when the parent is
+    unsampled.
+    """
 
     def __init__(self, root: Sampler, /) -> None:
         raise NotImplementedError

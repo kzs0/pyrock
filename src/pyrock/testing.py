@@ -84,12 +84,16 @@ class CapturedSpans(Sequence[CapturedSpan]):
     def names(self) -> list[str]:
         raise NotImplementedError
 
-    def find(self, **filters: Any) -> list[CapturedSpan]:
-        """Spans whose fields (``name=``, ``kind=`` ...) match all filters."""
+    def find(self, filters: Mapping[str, Any] | None = None, /, **kw: Any) -> list[CapturedSpan]:
+        """Spans whose fields (``name=``, ``kind=`` ...) match all filters.
+
+        ``filters`` is an optional positional mapping (merged with ``kw``,
+        keywords win) for keys that are not identifiers.
+        """
         raise NotImplementedError
 
-    def one(self, **filters: Any) -> CapturedSpan:
-        """Exactly one matching span (``AssertionError`` otherwise)."""
+    def one(self, filters: Mapping[str, Any] | None = None, /, **kw: Any) -> CapturedSpan:
+        """Exactly one matching span (``AssertionError`` otherwise); filters as in :meth:`find`."""
         raise NotImplementedError
 
     def __getitem__(self, index: Any) -> Any:
@@ -102,23 +106,37 @@ class CapturedSpans(Sequence[CapturedSpan]):
 class CapturedMetrics:
     """Read access to the captured registry."""
 
-    def value(self, name: str, /, **labels: str) -> float | None:
-        """Counter/gauge value (histogram: count) of the series matching ``labels``."""
+    def value(
+        self, name: str, labels: Mapping[str, str] | None = None, /, **kw: str
+    ) -> float | None:
+        """Counter/gauge value (histogram: count) of the series matching the labels.
+
+        ``labels`` is an optional positional mapping for dotted keys
+        (``{"worker.type": "async"}``), merged with ``kw`` (keywords win).
+        Dots in label keys are matched as underscores. Works inside the block.
+        """
         raise NotImplementedError
 
     def text(self) -> str:
-        """The Prometheus exposition text."""
+        """The Prometheus exposition text (also valid inside the ``with`` block)."""
         raise NotImplementedError
 
 
 class CapturedLogs(Sequence[dict[str, Any]]):
     """Parsed JSON log records emitted inside a capture."""
 
-    def find(self, **filters: Any) -> dict[str, Any]:
-        """The first record whose keys match all filters (``AssertionError`` if none)."""
+    def find(self, filters: Mapping[str, Any] | None = None, /, **kw: Any) -> dict[str, Any]:
+        """The first record whose keys match all filters (``AssertionError`` if none).
+
+        ``filters`` is an optional positional mapping for dotted keys
+        (``{"http.route": "/x"}``), merged with ``kw`` (keywords win).
+        """
         raise NotImplementedError
 
-    def find_all(self, **filters: Any) -> list[dict[str, Any]]:
+    def find_all(
+        self, filters: Mapping[str, Any] | None = None, /, **kw: Any
+    ) -> list[dict[str, Any]]:
+        """Every record matching the filters (same rules as :meth:`find`)."""
         raise NotImplementedError
 
     def __getitem__(self, index: Any) -> Any:
@@ -161,6 +179,11 @@ def capture(
 
     Defaults: ``server_enabled=False``, ``disable_environment_detection=True``,
     ``runtime_metrics=False``, ``log_install="pyrock"``, environment ignored.
+
+    Spans are complete once the block exits; ``metrics.text()`` and
+    ``metrics.value()`` work inside it. On exit the instance is shut down and
+    the previously active instance (if any) is restored, so nested captures
+    and ``with pyrock.init()`` blocks compose.
     """
     raise NotImplementedError
 

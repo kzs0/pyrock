@@ -7,34 +7,35 @@ languages.
 
 Environment variables read by :meth:`Config.from_env`:
 
-==================================== ==============================
-``BEDROCK_SERVICE``                  ``service``
-``BEDROCK_TRACE_URL``                ``trace_url``
-``BEDROCK_TRACE_PROTOCOL``           ``trace_protocol`` (grpc/http)
-``BEDROCK_TRACE_INSECURE``           ``trace_insecure``
-``BEDROCK_TRACE_SAMPLE_RATE``        ``trace_sample_rate``
-``BEDROCK_LOG_LEVEL``                ``log_level``
-``BEDROCK_LOG_FORMAT``               ``log_format``
-``BEDROCK_LOG_ADD_SOURCE``           ``log_add_source``
-``BEDROCK_LOG_CANONICAL``            ``log_canonical``
-``BEDROCK_LOG_INSTALL``              ``log_install`` (Python only)
-``BEDROCK_METRIC_PREFIX``            ``metric_prefix``
-``BEDROCK_METRIC_BUCKETS``           ``metric_buckets`` (comma-separated)
-``BEDROCK_METRIC_SERIES_LIMIT``      ``metric_series_limit``
-``BEDROCK_METRIC_FAMILY_LIMIT``      ``metric_family_limit``
-``BEDROCK_RUNTIME_METRICS``          ``runtime_metrics``
-``BEDROCK_SERVER_ENABLED``           ``server_enabled``
-``BEDROCK_SERVER_ADDR``              ``server_addr``
-``BEDROCK_SERVER_METRICS``           ``server_metrics``
-``BEDROCK_SERVER_PPROF``             ``server_pprof``
-``BEDROCK_SERVER_READ_TIMEOUT``      ``server_read_timeout``
-``BEDROCK_SERVER_READ_HEADER_TIMEOUT`` ``server_read_header_timeout``
-``BEDROCK_SERVER_WRITE_TIMEOUT``     ``server_write_timeout``
-``BEDROCK_SERVER_IDLE_TIMEOUT``      ``server_idle_timeout``
-``BEDROCK_SERVER_MAX_HEADER_BYTES``  ``server_max_header_bytes``
-``BEDROCK_DISABLE_ENV_DETECTION``    ``disable_environment_detection``
-``BEDROCK_SHUTDOWN_TIMEOUT``         ``shutdown_timeout``
-==================================== ==============================
+========================================= ==============================
+``BEDROCK_SERVICE``                       ``service``
+``BEDROCK_TRACE_URL``                     ``trace_url``
+``BEDROCK_TRACE_PROTOCOL``                ``trace_protocol`` (grpc/http)
+``BEDROCK_TRACE_INSECURE``                ``trace_insecure``
+``BEDROCK_TRACE_SAMPLE_RATE``             ``trace_sample_rate``
+``BEDROCK_LOG_LEVEL``                     ``log_level``
+``BEDROCK_LOG_FORMAT``                    ``log_format``
+``BEDROCK_LOG_ADD_SOURCE``                ``log_add_source``
+``BEDROCK_LOG_CANONICAL``                 ``log_canonical``
+``BEDROCK_LOG_INSTALL``                   ``log_install`` (Python only)
+``BEDROCK_METRIC_PREFIX``                 ``metric_prefix``
+``BEDROCK_METRIC_BUCKETS``                ``metric_buckets`` (comma-separated)
+``BEDROCK_METRIC_SERIES_LIMIT``           ``metric_series_limit``
+``BEDROCK_METRIC_FAMILY_LIMIT``           ``metric_family_limit``
+``BEDROCK_RUNTIME_METRICS``               ``runtime_metrics``
+``BEDROCK_SERVER_ENABLED``                ``server_enabled``
+``BEDROCK_SERVER_ADDR``                   ``server_addr``
+``BEDROCK_SERVER_METRICS``                ``server_metrics``
+``BEDROCK_SERVER_PPROF``                  ``server_pprof``
+``BEDROCK_SERVER_READ_TIMEOUT``           ``server_read_timeout``
+``BEDROCK_SERVER_READ_HEADER_TIMEOUT``    ``server_read_header_timeout``
+``BEDROCK_SERVER_WRITE_TIMEOUT``          ``server_write_timeout``
+``BEDROCK_SERVER_IDLE_TIMEOUT``           ``server_idle_timeout``
+``BEDROCK_SERVER_MAX_HEADER_BYTES``       ``server_max_header_bytes``
+``BEDROCK_SERVER_MAX_CONNECTIONS``        ``server_max_connections`` (Python only)
+``BEDROCK_DISABLE_ENVIRONMENT_DETECTION`` ``disable_environment_detection``
+``BEDROCK_SHUTDOWN_TIMEOUT``              ``shutdown_timeout``
+========================================= ==============================
 """
 
 from __future__ import annotations
@@ -89,7 +90,8 @@ ENV_VARS: Mapping[str, str] = {
     "server_write_timeout": "BEDROCK_SERVER_WRITE_TIMEOUT",
     "server_idle_timeout": "BEDROCK_SERVER_IDLE_TIMEOUT",
     "server_max_header_bytes": "BEDROCK_SERVER_MAX_HEADER_BYTES",
-    "disable_environment_detection": "BEDROCK_DISABLE_ENV_DETECTION",
+    "server_max_connections": "BEDROCK_SERVER_MAX_CONNECTIONS",
+    "disable_environment_detection": "BEDROCK_DISABLE_ENVIRONMENT_DETECTION",
     "shutdown_timeout": "BEDROCK_SHUTDOWN_TIMEOUT",
 }
 """Config field -> environment variable."""
@@ -155,6 +157,11 @@ class Config:
     server_write_timeout: float = 30.0
     server_idle_timeout: float = 120.0
     server_max_header_bytes: int = 1 << 20
+    server_max_connections: int = 64
+    """Concurrent connection cap (maps to ``server.Config.max_connections``).
+
+    A connection over the cap gets ``503`` and is then closed.
+    """
 
     # privacy / environment / profiles
     data_policy: Policy | None = None
@@ -196,7 +203,12 @@ class Config:
                 out.append("metric_buckets must be finite numbers")
             elif any(b >= c for b, c in itertools.pairwise(buckets)):
                 out.append("metric_buckets must be strictly increasing")
-        for name in ("metric_series_limit", "metric_family_limit", "server_max_header_bytes"):
+        for name in (
+            "metric_series_limit",
+            "metric_family_limit",
+            "server_max_header_bytes",
+            "server_max_connections",
+        ):
             if not is_positive_int(getattr(self, name)):
                 out.append(f"{name} must be a positive integer")
         for name in _DURATION_FIELDS:

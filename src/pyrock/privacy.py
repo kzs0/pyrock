@@ -15,6 +15,11 @@ and profile labels:
   arbitrary objects.
 * Resource keys that identify a host, process, container or k8s object are
   dropped unless ``resource_keys`` allowlists them.
+* Sensitive HTTP attributes (``http.user_agent``, and the raw outgoing
+  ``http.target`` / ``http.url``) are emitted only when ``attribute_keys``
+  allowlists them (exact key or a ``"http.*"`` wildcard), even when
+  ``attribute_keys`` is ``None``. URLs always lose credentials, query and
+  fragment (:func:`sanitize_url`).
 
 This is a leaf module: it imports nothing from pyrock.
 """

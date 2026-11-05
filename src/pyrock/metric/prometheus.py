@@ -4,6 +4,11 @@
 increasing, cumulative counts monotonic and not above the count, names and
 label names valid) and only then writes text. A validation failure raises
 :class:`ExpositionError`, and ``/metrics`` answers 500 with no partial body.
+
+Sample values and bucket bounds use Go's ``%g`` formatting (``strconv``
+``FormatFloat(v, 'g', -1, 64)``): ``1``, ``0.5``, ``1e+06``, ``+Inf``, ``NaN``.
+Metric family names turn dots into underscores (``http.request`` ->
+``http_request_count``).
 """
 
 from __future__ import annotations

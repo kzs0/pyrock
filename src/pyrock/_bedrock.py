@@ -62,9 +62,16 @@ LogItem = Mapping[str, AttrValue] | BaseException
 class Bedrock:
     """One observability instance: tracer, metrics registry, logging, server, exporters.
 
-    ``Bedrock(config)`` builds an instance without activating it (Go:
-    ``bedrock.New``); :func:`init` builds and activates one. It is a sync and
-    async context manager that shuts down on exit.
+    ``Bedrock(config)`` builds a **fully live** instance (Go: ``bedrock.New``):
+    the constructor starts exporters, the observability server and log
+    installation according to config, but does not activate it; the caller
+    must shut it down. :func:`init` builds and activates one.
+
+    It is a sync and async context manager. Exiting the ``with`` block shuts
+    down and restores the context value that was active before (when the
+    instance was activated by :func:`init` or entry), which deactivates it.
+    Nested ``with pyrock.init()`` / ``testing.capture()`` blocks therefore
+    restore the outer active instance on exit.
     """
 
     def __init__(
@@ -90,7 +97,11 @@ class Bedrock:
 
     @property
     def static_attrs(self) -> Mapping[str, AttrValue]:
-        """Detected resource attrs followed by user ``static_attrs`` (user values win)."""
+        """Detected resource attrs followed by user ``static_attrs`` (user values win).
+
+        As in Go, these are *resource* attributes on exported spans, top-level
+        fields in log records, and labels on metrics.
+        """
         raise NotImplementedError
 
     @property
@@ -283,6 +294,11 @@ def init(
     5. register the fork hook.
 
     ``shutdown_atexit=True`` opts into an ``atexit`` shutdown (off by default).
+
+    Exiting ``with pyrock.init(...)`` shuts the instance down and restores the
+    previously active context value (the outer instance, or none), which
+    deactivates this one. There is no process-wide default: threads started
+    with plain ``threading.Thread`` see the noop unless context is copied.
     """
     raise NotImplementedError
 

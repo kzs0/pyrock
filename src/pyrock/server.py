@@ -3,7 +3,12 @@
 Security defaults match Go: loopback-only address, pprof off unless both
 enabled and given an explicit handler, deadline-based header reads (Slowloris),
 read/write/idle timeouts, a header byte limit (431 and close), a connection
-cap with reject-on-full, and graceful shutdown.
+cap with reject-on-full (a rejected connection gets ``503`` and is then
+closed), and graceful shutdown.
+
+With ``pprof`` and a ``profile_handler``, requests under ``/debug/pprof/`` are
+passed to the handler with ``PATH_INFO`` unchanged (the full
+``/debug/pprof/...`` path).
 
 .. code-block:: python
 
@@ -44,6 +49,10 @@ class Config:
     max_header_bytes: int = 1 << 20
     shutdown_timeout: float = 30.0
     max_connections: int = 64
+    """Concurrent connection cap; a connection over it gets ``503`` and is closed.
+
+    ``pyrock.Config.server_max_connections`` maps here.
+    """
 
     def __post_init__(self) -> None:
         problems: list[str] = []

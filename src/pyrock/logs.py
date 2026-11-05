@@ -8,6 +8,9 @@
      "service":"users-api","env":"production","user_id":"123",
      "trace_id":"...","span_id":"...","logger":"myapp.users"}
 
+  ``level`` uses Go's names: ``DEBUG``, ``INFO``, ``WARN`` (Python's
+  ``WARNING``), ``ERROR``; ``CRITICAL`` stays ``CRITICAL``. Static attrs are
+  top-level fields.
 * :class:`CorrelationFilter`: adds ``trace_id``, ``span_id`` and static attrs
   to records for apps that own their logging config.
 * :func:`log_canonical`: the ``operation.complete`` record.
@@ -136,5 +139,12 @@ def log_canonical(
     attributes: Mapping[str, Any],
     span_context: SpanContext | None = None,
 ) -> None:
-    """Emit the ``operation.complete`` INFO record (same fields as Go's canonical log)."""
+    """Emit the ``operation.complete`` INFO record (same fields as Go's canonical log).
+
+    Fields: ``operation``, ``duration_ms``, ``success``, ``attributes``,
+    ``trace_id``, ``span_id``. When ``success`` is ``False`` the record also
+    carries top-level ``error``, ``error.type`` and ``error.fingerprint``
+    (taken from ``attributes``); ``error.message`` is added only when the
+    privacy policy has ``allow_error_details``.
+    """
     raise NotImplementedError

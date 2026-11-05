@@ -22,11 +22,16 @@ Type mapping (OTLP / Prometheus label / log):
 * ``BaseException`` -> the error attributes below
 * anything else -> dropped and counted (never ``str()``-ed)
 
-Error attributes (same keys as Go): ``error`` (``True``), ``error.type``
-(qualified class name), ``error.message`` (only when the privacy policy allows
-error details), ``error.fingerprint``, ``error.chain``, ``error.stack`` (only
-with ``stack=True`` and ``allow_source_paths``), and for exception groups
-``error.group.count`` and ``error.types``.
+Error attributes (same keys as Go), with their value types:
+
+* ``error``: ``True`` (marks failure);
+* ``error.type``: ``str``, the qualified class name (``builtins.ValueError``);
+* ``error.message``: ``str``, only when the privacy policy allows error details;
+* ``error.fingerprint``: ``str`` of 16 lowercase hex characters;
+* ``error.chain``: ``list[str]`` of types along ``__cause__``/``__context__``;
+* ``error.stack``: ``str``, only with ``stack=True`` and ``allow_source_paths``;
+* exception groups: ``error.group.count`` (``int``) and ``error.types``
+  (``list[str]``).
 
 This is a leaf module: it imports nothing from pyrock.
 """
@@ -185,6 +190,8 @@ def qualified_name(tp: type[BaseException], /) -> str:
 
 def fingerprint(exc: BaseException, /, *, frames: int = 8) -> str:
     """Return a stable hash of the type and the top ``frames`` frames' module/qualname.
+
+    The result is 16 lowercase hex characters.
 
     Line numbers are excluded so the fingerprint survives unrelated edits.
     """

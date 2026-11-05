@@ -15,9 +15,18 @@ How a scope ends:
 * ``ExceptionGroup``: failure summarized in ``error.group.count`` /
   ``error.types``.
 
-A second ``operation("fetch")`` under the same parent is named ``fetch[1]``,
-then ``fetch[2]``; numbering applies to span names only. Operations inside a
-source are prefixed with the source name.
+Duplicate-name numbering: a second ``operation("fetch")`` (or ``step``) under
+the same parent *operation or step* is named ``fetch[1]``, then ``fetch[2]``.
+Root operations and direct children of a source are never numbered, so span
+names stay bounded in loops. Numbering applies to span names only; metric
+families use the base name. Operations inside a source are prefixed with the
+source name.
+
+Decorators always wrap (``functools.wraps``) and resolve the active instance
+**at call time**, so functions decorated at import time, before ``init()``,
+are instrumented once an instance is active. With no active instance the
+wrapper costs one ``ContextVar.get()`` plus a direct call. Only an explicit
+noop ``bedrock=`` makes the decorator return the function unchanged.
 
 This module is private; its public names are re-exported from ``pyrock``.
 """
@@ -198,6 +207,11 @@ class _Scope:
     Each ``with`` entry (or decorated call) starts a new live object; a scope
     may be reused and nested. Decorators support sync functions, coroutines,
     generators and async generators (the scope spans the whole iteration).
+
+    Decorating always returns a ``functools.wraps`` wrapper that resolves the
+    instance at call time (explicit ``bedrock=`` pinned, else
+    ``pyrock.current()``), so decoration before ``init()`` works. The function
+    is returned unchanged only when an explicit noop ``bedrock=`` was given.
     """
 
     def __call__(self, fn: F, /) -> F:
@@ -265,7 +279,10 @@ def operation(
     """Open an operation (context manager or decorator).
 
     ``bedrock`` pins an explicit instance; by default the active one is
-    resolved from context when the scope is entered (noop if none).
+    resolved from context when the scope is entered or the decorated function
+    is called (noop if none). Duplicate names under the same parent operation
+    or step are numbered ``name[1]``, ``name[2]``, ...; root operations and
+    direct children of a source are never numbered.
     """
     raise NotImplementedError
 

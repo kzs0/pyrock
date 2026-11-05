@@ -221,6 +221,14 @@ async def main():
         await serve()
 ```
 
+Exiting `with pyrock.init()` shuts the instance down and restores the context
+value that was active before, which deactivates it. Nested `with pyrock.init()`
+and `testing.capture()` blocks therefore restore the outer active instance.
+
+`pyrock.Bedrock(...)` (Go: `bedrock.New`) builds a **fully live** instance: the
+constructor starts exporters, the server and log installation according to
+config. It is not activated, and the caller must shut it down.
+
 Without `with`, call `bedrock.shutdown(timeout=30.0)`. Shutdown is idempotent and
 thread-safe. It flushes spans, does a final metrics push, stops profile export
 and the server, and restores logging handlers. pyrock **does not** register
@@ -301,10 +309,13 @@ from `operation.go`.
 each with the declared labels plus static labels. Dots in label keys become
 underscores (`http.method` → `http_method`), as in Go.
 
-**Nesting and numbering:** a second `operation("fetch")` under the same parent
-becomes `fetch[1]`, then `fetch[2]`, and so on. This uses the same per-parent
-counter as Go, and keeps sibling spans distinct while metric names stay stable.
-The numbering applies to span names only. Metric families use the base name.
+**Nesting and numbering:** a second `operation("fetch")` (or step) under the
+same parent operation or step becomes `fetch[1]`, then `fetch[2]`, and so on.
+This uses the same per-parent counter as Go, and keeps sibling spans distinct
+while metric names stay stable. Root operations and direct children of a
+source are never numbered, so span names stay bounded in loops. The numbering
+applies to span names only. Metric families use the base name, with dots turned
+into underscores (`http.request` → `http_request_count`).
 
 **Manual lifecycle**, for callbacks, framework hooks and producer/consumer
 handoffs:
@@ -383,6 +394,7 @@ with pyrock.ContextThreadPoolExecutor(max_workers=8) as pool:
 
 # Or start a thread with context:
 pyrock.Thread(target=consume).start()          # threading.Thread subclass that copies context
+pyrock.Thread(target=consume, context=ctx)     # explicit context, as on 3.14's threading.Thread
 
 # asyncio.to_thread already copies context, so it works unchanged.
 ```
@@ -404,10 +416,16 @@ returns the active `Bedrock`, or the noop singleton. `pyrock.current_operation()
 
 When `init()` hasn't run or isn't active in this context, every helper returns
 a **preallocated singleton** noop (operation, step, source, counter, gauge,
-histogram). Its `__enter__` returns itself, its methods are empty, and its
-decorators return the function unchanged, so there is not even wrapper overhead.
-Library authors can instrument freely: apps that never call `init()` pay about
-one `ContextVar.get()` per call. A benchmark in CI asserts this using
+histogram). Its `__enter__` returns itself and its methods are empty.
+
+Decorators always wrap. `@pyrock.operation`, `@pyrock.step` and `@pyrock.source`
+return a `functools.wraps` wrapper that looks up the active instance **at call
+time**, so functions decorated at import time, before `init()`, are
+instrumented once an instance is active. The noop path costs one
+`ContextVar.get()` plus a direct call. The function is returned unchanged only
+when an explicit noop `bedrock=` is given. Library authors can instrument
+freely: apps that never call `init()` pay about one `ContextVar.get()` per
+call. A benchmark in CI asserts this using
 `tracemalloc` (no allocations in steady state) and a timing budget, like Go's
 `BenchmarkOperation_Noop`.
 
@@ -457,12 +475,17 @@ exception exit) produces the same keys as Go:
   (`builtins.ValueError`, `myapp.errors.NotFound`).
 - `error.message`, only if `privacy.allow_error_details`.
 - `error.fingerprint`: a stable hash of the type plus the module/qualname of the
-  top N frames, with no line numbers, so it survives unrelated edits.
-- `error.chain`: types along `__cause__` / `__context__`, so wrapped errors are
-  visible like Go's `%w` chains.
+  top N frames, with no line numbers, so it survives unrelated edits. It is 16
+  lowercase hex characters.
+- `error.chain`: types along `__cause__` / `__context__` as a `list[str]`, so
+  wrapped errors are visible like Go's `%w` chains.
 - `error.stack`: a formatted traceback, only with `stack=True` and
   `allow_source_paths`. Otherwise paths are trimmed to `module:function`.
-- `ExceptionGroup`: `error.group.count`, `error.types`.
+- `ExceptionGroup`: `error.group.count` (an `int`) and `error.types` (a
+  `list[str]`).
+
+**Static attrs** are *resource* attributes on exported spans (as in Go),
+top-level fields in log records, and labels on metrics.
 
 ---
 
@@ -508,6 +531,7 @@ class Config:
     server_write_timeout: float = 30.0
     server_idle_timeout: float = 120.0
     server_max_header_bytes: int = 1 << 20
+    server_max_connections: int = 64              # Python-specific, see §11
 
     # privacy / environment / profiles
     data_policy: privacy.Policy | None = None
@@ -528,8 +552,9 @@ class Config:
   variables keep Go's syntax (`10s`, `500ms`, `1m30s`) so one `.env` file
   configures both languages. A bare number is read as seconds.
 - **Env vars are identical:** `BEDROCK_SERVICE`, `BEDROCK_TRACE_URL`,
-  `BEDROCK_SERVER_ADDR` and every other variable in the Go table, plus
-  `BEDROCK_LOG_INSTALL`.
+  `BEDROCK_SERVER_ADDR`, `BEDROCK_DISABLE_ENVIRONMENT_DETECTION` and every other
+  variable in the Go table, plus the Python-only `BEDROCK_LOG_INSTALL` and
+  `BEDROCK_SERVER_MAX_CONNECTIONS` (a positive integer).
 - Validation matches Go: the sample rate must be in [0, 1], and
   `trace_sample_rate=0` disables recording. Buckets must be finite and strictly
   increasing. Timeouts must be positive. `server_pprof=True` without a
@@ -583,10 +608,16 @@ pyrock.init(trace_sampler=sampler.ParentBased(sampler.Ratio(0.1)))
 ```
 
 `AlwaysOn`, `AlwaysOff`, `Ratio(r)` (deterministic on the trace-ID's low 8 bytes,
-the same as Go, so mixed-language traces make the same decision), and
-`ParentBased(root)` (the default). Sampler is a `Protocol` with
+so every service makes the same decision for a trace), and `ParentBased(root)`
+(the default). Sampler is a `Protocol` with
 `should_sample(trace_id, name, parent_sampled) -> SamplingResult`. As in Go,
 sampling controls export, not span creation.
+
+**Differences from Go**, which pyrock makes on purpose (and the README
+documents): Go's `RatioSampler` draws a random number per span, whereas
+`Ratio` depends only on the trace ID. Go's `ParentBasedSampler` consults the
+root sampler when the parent is unsampled, whereas `ParentBased` drops spans
+whose parent is unsampled.
 
 ### 7.3 Export
 
@@ -618,6 +649,9 @@ schema and runs against a real collector.
 batches of 512, a 5-second schedule, a background thread, and drop-on-full with
 counters. `bedrock.trace_export_stats()` returns
 `BatchStats(exported, dropped, failed, queue_len)`.
+
+Every export carries the instrumentation scope name `pyrock` and the package
+version. Static attrs are sent as resource attributes.
 
 ---
 
@@ -666,12 +700,17 @@ JSON shape (identical keys to Go):
  "logger":"myapp.users"}
 ```
 
+`level` uses Go's names: `DEBUG`, `INFO`, `WARN` and `ERROR`. Python's
+`CRITICAL` stays `CRITICAL`. Static attrs are top-level fields.
+
 `logger` is extra on the Python side. `log_add_source` adds `source` as
 `module:function:line`, or the full path when `allow_source_paths`.
 
 **Canonical logs** (`log_canonical=True`): when an operation ends it emits
 `operation.complete` at INFO with `operation`, `duration_ms`, `success`,
-`attributes`, `trace_id` and `span_id`. It is the same record Go produces.
+`attributes`, `trace_id` and `span_id`. It is the same record Go produces. A
+failed operation's record also has top-level `error`, `error.type` and
+`error.fingerprint`. `error.message` is added only with `allow_error_details`.
 
 ---
 
@@ -689,6 +728,7 @@ app = Middleware(app,                         # Flask: app.wsgi_app = Middleware
     success_codes=range(200, 400),
     trace_propagation=True,
     route=lambda environ: environ.get("pyrock.route"),   # see "routes" below
+    bedrock=None,                             # explicit instance; see "instances and threads"
 )
 ```
 
@@ -707,24 +747,41 @@ Both middlewares:
   starts a new trace and ignores tracestate.
 - Open a `SERVER`-kind operation with the default attrs `http.method`,
   `http.route`, `http.scheme`, `http.host` and `http.status_code`.
-  `http.user_agent` is privacy-gated and off by default, as in Go. The default
+  `http.user_agent` is sensitive and off by default, as in Go: it is emitted
+  only when the policy's `attribute_keys` allowlist matches it
+  (`"http.user_agent"` or `"http.*"`). The default
   labels are `http_method`, `http_route` and `http_status_code`.
 - Capture the **final** status. In WSGI that is the last `start_response` call.
   In ASGI it is `http.response.start`, skipping informational 1xx responses.
 - When an exception escapes the app, record a failure with `http.status_code=500`
-  and re-raise (Go's panic behaviour). A response with a status outside
+  and re-raise (Go's panic behaviour). If the exception comes after headers were
+  sent, it still marks failure and is re-raised, but `http.status_code` stays
+  the status already sent. A response with a status outside
   `success_codes` marks failure without raising.
 - Measure duration until the response body finishes: when the WSGI iterable's
   `close()` runs, or at the last ASGI `more_body=False`. This way streaming
   responses are timed correctly.
 - ASGI passes `lifespan` and `websocket` scopes through. WebSocket
   instrumentation is opt-in (`websocket=True`), and covers the whole connection
-  as one operation.
+  as one `SERVER` operation named `http.websocket` (an explicit
+  `operation_name=` overrides it), with `http.route` and `http.scheme`
+  (`ws`/`wss`). It ends when the connection closes. In ASGI,
+  `operation_name=None` (the default) means `http.request` for HTTP and
+  `http.websocket` for websockets.
+
+**Instances and threads.** There is **no** process-wide default instance, so a
+plain `threading.Thread` still sees the noop. `wsgi.Middleware`,
+`asgi.Middleware` and `http.instrument_http_server` capture the instance when
+they are constructed: either `bedrock=` or `pyrock.current()` at that point. If
+that is the noop, they resolve `current()` per request instead. Each request is
+handled inside a context with that instance active, so handler code on server
+worker threads is instrumented.
 
 **Routes and cardinality.** Raw paths would break the cardinality guarantee, so
 `http.route` must be a *template* or `"_"`. Templates come from, in order:
 
-1. the `route=` callable, if given;
+1. the `route=` callable, if given (a `None` result falls through to the next
+   source);
 2. the ASGI `scope["route"]` path format (Starlette/FastAPI set this), or
    `scope["pyrock.route"]` / `environ["pyrock.route"]` if a framework hook sets it;
 3. `"_"` otherwise. Unmatched and custom routers share one series, as in Go.
@@ -734,8 +791,9 @@ a Flask `before_request` that sets `request.url_rule.rule`, a Django middleware
 that sets `resolver_match.route`, a Starlette router hook. Each is about five
 lines, in the same spirit as Go's copy-in `example/grpc`.
 
-`pyrock.http.instrument_http_server(MyHandler)` wraps `http.server.BaseHTTPRequestHandler`
-subclasses for stdlib-only services.
+`pyrock.http.instrument_http_server(MyHandler, bedrock=None)` wraps
+`http.server.BaseHTTPRequestHandler` subclasses for stdlib-only services, with
+the same instance rules as the middlewares.
 
 ### 9.3 Client
 
@@ -755,16 +813,17 @@ handler = pyrock.http.TracingHandler()     # a urllib.request.BaseHandler
 ```
 
 Client spans record `http.method`, `http.host`, `http.scheme` and
-`http.status_code`. `http.url` and `http.target` are sanitised: credentials,
-query and fragment are removed, and raw outgoing paths are omitted unless the
-privacy policy allows them. 4xx and 5xx responses set error status. Redirects
+`http.status_code`. Raw outgoing paths and URLs (`http.target`, `http.url`) are
+emitted only when allowlisted in the policy's `attribute_keys`. Credentials,
+query and fragment are always stripped, and URL userinfo is never turned into
+auth. 4xx and 5xx responses set error status. Redirects
 keep the same trace.
 
 `pyrock.http.request` returns a small `Response` object (`status`, `headers`,
 `read()`, `json()`, `text`, and context manager support) wrapping the
 `http.client.HTTPResponse`. `HTTPError` is caught and returned as a response by
 default (`raise_for_status=False`). This is friendlier than raw `urllib`, which
-raises.
+raises. With `raise_for_status=True`, `urllib.error.HTTPError` is raised.
 
 For third-party clients, one primitive and two recipes cover most code:
 
@@ -883,7 +942,7 @@ dashboards work.
 snapshot first**: bucket bounds finite and increasing, cumulative counts
 monotonic and no larger than the count, names and labels valid. Then it writes
 text format 0.0.4. A validation failure raises `ExpositionError`, and `/metrics`
-returns 500 with no partial body, as in Go.
+returns 500 with no partial body, as in Go. Numbers use Go's `%g` formatting.
 
 ---
 
@@ -896,7 +955,7 @@ thread at `127.0.0.1:9090` (loopback only by default).
 |---|---|
 | `/metrics` | Prometheus text (if `server_metrics`) |
 | `/health`, `/ready` | `200 ok` |
-| `/debug/pprof/*` | Only if `server_pprof` **and** `server_profile_handler` are set (§12.3) |
+| `/debug/pprof/*` | Only if `server_pprof` **and** `server_profile_handler` are set (§12.3). The handler receives the request with `PATH_INFO` unchanged. |
 
 Security defaults match Go:
 
@@ -906,7 +965,7 @@ Security defaults match Go:
 | `read_timeout=10s`, `write_timeout=30s` | Deadline-based socket timeouts per phase |
 | `idle_timeout=120s` | Keep-alive wait timeout between requests |
 | `max_header_bytes=1MiB` | Counted while reading. Over the limit returns 431 and closes. |
-| Connection cap | `ThreadingHTTPServer` subclass with a bounded semaphore (default 64 concurrent connections) and reject-on-full. Python threads are more expensive than goroutines, so this guard is needed here. |
+| Connection cap | `ThreadingHTTPServer` subclass with a bounded semaphore (default 64 concurrent connections, `server_max_connections` / `BEDROCK_SERVER_MAX_CONNECTIONS`) and reject-on-full: a rejected connection gets `503` and is then closed. Python threads are more expensive than goroutines, so this guard is needed here. |
 | Graceful shutdown | `shutdown()` stops accepting, waits for in-flight requests up to `shutdown_timeout`, then closes. |
 
 The server can also be run manually:
@@ -937,7 +996,7 @@ type from stdlib pieces and encodes the results **natively** as OTLP Profiles
 |---|---|---|---|
 | `CPU` | CPU samples | A sampler thread wakes at 100 Hz (configurable), reads `sys._current_frames()`, and keeps threads whose CPU clock advanced (`time.pthread_getcpuclockid` + `clock_gettime` on Linux, with a wall-clock fallback marked as such). On 3.12+ it reads asyncio task identity as a label. | `samples/count`, `cpu/nanoseconds` |
 | `WALL` *(Python extra)* | — | The same sampler without the CPU filter. Useful for I/O-bound async apps. | `samples/count`, `wall/nanoseconds` |
-| `HEAP` | allocation samples | `tracemalloc` snapshot diffs per interval (`traceback_limit` 32). tracemalloc starts only when `HEAP` is selected and is never stopped if someone else started it. The cost is documented (around 10–30% allocation overhead). | `alloc_space/bytes`, `inuse_space/bytes`, `alloc_objects/count` |
+| `HEAP` | allocation samples | `tracemalloc` snapshot diffs per interval (`traceback_limit` 32). tracemalloc starts only when `HEAP` is selected; on export stop it is stopped only if pyrock started it. The cost is documented (around 10–30% allocation overhead). | `alloc_space/bytes`, `inuse_space/bytes`, `alloc_objects/count` |
 | `GOROUTINE` | goroutine stacks | Stacks of all threads (`sys._current_frames`) plus pending asyncio tasks (`Task.get_stack`) on tracked loops. Exposed as `ProfileType.THREADS`, with `GOROUTINE` as an alias for parity. | `threads/count`, `tasks/count` |
 | `MUTEX` / `BLOCK` | contention | Python exposes no global contention data. pyrock provides **opt-in instrumented primitives**, `pyrock.profile.Lock`, `RLock`, `Condition` and `Semaphore`, as drop-in replacements that record wait time with `sample_fraction` / `block_rate` sampling. The `MUTEX`/`BLOCK` profiles aggregate those. With no instrumented locks they are empty and say so in a `profile.note` attribute. | `contentions/count`, `delay/nanoseconds` |
 
@@ -984,7 +1043,7 @@ from pyrock.profile import debug
 pyrock.init(server_pprof=True, server_profile_handler=debug.app())
 ```
 
-`/debug/pprof/profile?seconds=N` (capped at 30), `/heap`, `/goroutine`
+`/debug/pprof/profile?seconds=N` (`N` above 30 is rejected with `400`, as in Go), `/heap`, `/goroutine`
 (threads and tasks), `/mutex` and `/block` return **gzipped pprof** that works
 with `go tool pprof` and Pyroscope. `?debug=1` on `goroutine` returns text
 stacks. GET only. Importing `pyrock` registers nothing. This module has to be
@@ -1098,8 +1157,15 @@ This is the same wiring as Go's `wireCloud()`:
 
 - Traces use OTLP/gRPC over `_h2` with the `x-bedrock-key` metadata header. The
   batch processor is swapped for a larger cloud one.
-- `RetryExporter` makes 3 attempts with 1 s / 2 s / 4 s backoff and honours
-  shutdown deadlines (it waits on a `threading.Event`, not `time.sleep`).
+- Traces go to `traces_endpoint` when set (a bare `host:port` or a URL; a
+  URL's scheme is stripped and the default port added, as in Go's endpoint
+  normalisation). Otherwise the target is derived from `endpoint`.
+- `RetryExporter` makes one initial attempt plus one retry per
+  `retry_backoff` entry: by default `(1.0, 2.0, 4.0)` seconds, so 4 calls in
+  all, as in Go. `retry_backoff` is validated (each entry finite and `>= 0`, at
+  most 10 entries, a list is accepted and stored as a tuple), and `()` disables
+  retries. It honours shutdown deadlines (it waits on a `threading.Event`, not
+  `time.sleep`).
 - `FanOutExporter`: when `trace_url` is also set, each batch goes to both
   exporters. Every exporter is always called, and the first error is returned.
 - Metrics push sends Prometheus text with `Authorization: Bearer` at each
@@ -1109,7 +1175,8 @@ This is the same wiring as Go's `wireCloud()`:
 - Profile push runs the collectors from §12 at `profile_interval` and uses
   OTLP profiles.
 
-`pyrock.cloud(...)` returns a `CloudConfig` dataclass. The `api_key` field is
+`pyrock.cloud(...)` takes every `CloudConfig` field as a keyword (including
+`retry_backoff` and `traces_endpoint`) and returns a `CloudConfig` dataclass. The `api_key` field is
 excluded from `repr`/`__eq__` (`field(repr=False)`), so keys don't show up in
 logs or tracebacks.
 
@@ -1138,6 +1205,14 @@ async def test_async_path():
         await handler()
     assert t.spans.names() == ["http.request", "db.get_user", "db.get_user[1]"]
 ```
+
+Spans are complete once the block exits, while `t.metrics.text()` and
+`t.metrics.value()` also work inside it. `t.spans.find(kind=...)` filters by
+kind. The filter helpers (`metrics.value`, `logs.find`, `logs.find_all`,
+`spans.find`, `spans.one`) accept an optional positional mapping for dotted
+keys, as in `t.metrics.value("worker_jobs", {"worker.type": "async"})`, in
+addition to keywords. On exit, `capture()` restores the previously active
+instance, so nested captures compose.
 
 `capture()` is an ordinary context manager, so it needs no pytest plugin. A
 pytest entry point (`pyrock_capture` fixture) is registered through

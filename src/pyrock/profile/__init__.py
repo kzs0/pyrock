@@ -9,6 +9,10 @@
 ``BLOCK``   wait times recorded by :class:`Condition`/:class:`Semaphore`
 =========== ===============================================================
 
+``HEAP`` starts tracemalloc only if it is not already tracing, and stopping the
+exporter stops tracemalloc only if pyrock started it. Every upload carries an
+``x-profile-type`` header with the :class:`ProfileType` value.
+
 This package is never imported by ``import pyrock``; it loads on first use.
 """
 

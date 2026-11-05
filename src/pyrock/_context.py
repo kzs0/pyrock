@@ -85,7 +85,15 @@ class Thread(threading.Thread):
         kwargs: Mapping[str, Any] | None = None,
         *,
         daemon: bool | None = None,
+        context: contextvars.Context | None = None,
     ) -> None:
+        """Same as :class:`threading.Thread` plus ``context`` (as on 3.14's ``Thread``).
+
+        ``context=None`` copies the creator's context at construction time.
+        An explicit :class:`contextvars.Context` is used as given: ``run()``
+        executes inside it, as on 3.14 (pass ``contextvars.Context()`` for an
+        empty context).
+        """
         raise NotImplementedError
 
     def run(self) -> None:

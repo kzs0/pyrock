@@ -1,8 +1,14 @@
 """Preallocated noop singletons used when no ``Bedrock`` is active.
 
-``__enter__`` returns the object itself, methods do nothing, and decorators
-return the function unchanged, so library code pays roughly one
-``ContextVar.get()`` per call and allocates nothing in steady state.
+``__enter__`` returns the object itself and methods do nothing, so library
+code pays roughly one ``ContextVar.get()`` per call and allocates nothing in
+steady state.
+
+Decorators from the module helpers (``pyrock.operation`` etc.) always wrap and
+resolve the active instance at call time, so code decorated before ``init()``
+is instrumented later. A noop scope returns the function unchanged only when
+it came from an explicit noop instance (``bedrock=noop_bedrock()`` or
+``noop_bedrock().operation(...)``).
 """
 
 from __future__ import annotations
@@ -42,15 +48,24 @@ class NoopSource(Source):
 
 
 class NoopOperationScope(OperationScope):
-    """Enters as :data:`NOOP_OPERATION`; decorating returns the function unchanged."""
+    """Enters as :data:`NOOP_OPERATION`.
+
+    Decorating returns the function unchanged (explicit noop ``bedrock=`` only).
+    """
 
 
 class NoopStepScope(StepScope):
-    """Enters as :data:`NOOP_STEP`; decorating returns the function unchanged."""
+    """Enters as :data:`NOOP_STEP`.
+
+    Decorating returns the function unchanged (explicit noop ``bedrock=`` only).
+    """
 
 
 class NoopSourceScope(SourceScope):
-    """Enters as :data:`NOOP_SOURCE`; decorating returns the function unchanged."""
+    """Enters as :data:`NOOP_SOURCE`.
+
+    Decorating returns the function unchanged (explicit noop ``bedrock=`` only).
+    """
 
 
 class NoopCounter(Counter):

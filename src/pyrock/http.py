@@ -7,9 +7,12 @@
     opener = pyrock.http.build_opener(urllib.request.HTTPCookieProcessor())
 
 Client spans record ``http.method``, ``http.host``, ``http.scheme`` and
-``http.status_code``; ``http.url``/``http.target`` are sanitized (no
-credentials, query or fragment; raw paths only when the privacy policy allows).
-4xx/5xx set error status. Redirects stay in the same trace.
+``http.status_code``. Raw outgoing paths and URLs (``http.target``,
+``http.url``) are emitted only when allowlisted in the privacy policy's
+``attribute_keys``; credentials, query and fragment are always stripped, and
+URL userinfo is never turned into auth. 4xx/5xx set error status. Redirects
+stay in the same trace. ``raise_for_status=True`` raises
+:class:`urllib.error.HTTPError`.
 """
 
 from __future__ import annotations
@@ -20,9 +23,12 @@ import urllib.request
 from collections.abc import Callable, Iterable, Mapping
 from email.message import Message
 from types import TracebackType
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pyrock._bedrock import inject_headers
+
+if TYPE_CHECKING:
+    from pyrock._bedrock import Bedrock
 
 __all__ = [
     "Response",
@@ -123,7 +129,11 @@ def request(
     raise_for_status: bool = False,
     opener: urllib.request.OpenerDirector | None = None,
 ) -> Response:
-    """Send a request. ``HTTPError`` responses are returned unless ``raise_for_status``."""
+    """Send a request.
+
+    ``HTTPError`` responses are returned as a :class:`Response`; with
+    ``raise_for_status=True`` a :class:`urllib.error.HTTPError` is raised.
+    """
     raise NotImplementedError
 
 
@@ -159,6 +169,17 @@ def instrument_http_server(
     *,
     operation_name: str = "http.request",
     route: Callable[[http.server.BaseHTTPRequestHandler], str | None] | None = None,
+    bedrock: Bedrock | None = None,
 ) -> HandlerT:
-    """Return a subclass of a ``BaseHTTPRequestHandler`` that traces each request."""
+    """Return a subclass of a ``BaseHTTPRequestHandler`` that traces each request.
+
+    The instance is captured when the middleware is constructed: ``bedrock`` if given, else
+    ``pyrock.current()`` at that point. If that is the noop, ``current()`` is
+    resolved per request instead. Each request runs inside a context with that
+    instance active, so handler code on server worker threads is instrumented
+    (there is no process-wide default instance).
+
+    A ``route`` callable returning ``None`` falls back to the framework route
+    key, then to ``"_"``.
+    """
     raise NotImplementedError
