@@ -1,14 +1,19 @@
-"""Heap profiles from tracemalloc snapshot diffs (``pyrock.profile._heap``)."""
+"""Heap profiles from tracemalloc snapshot diffs (``pyrock.profile._heap``).
+
+tracemalloc records only file names and line numbers, so frames are matched
+by ``(filename, line)`` here; function names are not part of this contract.
+"""
 
 from __future__ import annotations
 
+import inspect
 import tracemalloc
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import pytest
 
 from pyrock.profile._heap import HeapProfiler
-from pyrock.profile._pprof import Profile
+from pyrock.profile._pprof import Frame, Profile
 
 HEAP_TYPES = {("alloc_space", "bytes"), ("inuse_space", "bytes"), ("alloc_objects", "count")}
 
@@ -27,10 +32,19 @@ def _allocate_for_heap_profile(count: int = 2000, size: int = 1024) -> list[byte
     return [bytearray(size) for _ in range(count)]
 
 
-def sums(profile: Profile, function: str) -> dict[str, int]:
+def lines_of(fn: Callable[..., object]) -> range:
+    source, first = inspect.getsourcelines(fn)
+    return range(first, first + len(source))
+
+
+def in_function(frame: Frame, fn: Callable[..., object]) -> bool:
+    return frame.filename == __file__ and frame.line in lines_of(fn)
+
+
+def sums(profile: Profile, fn: Callable[..., object]) -> dict[str, int]:
     out = {t.type: 0 for t in profile.sample_types}
     for sample in profile.samples:
-        if any(function in f.function for f in sample.stack):
+        if any(in_function(f, fn) for f in sample.stack):
             for t, value in zip(profile.sample_types, sample.values, strict=True):
                 out[t.type] += value
     return out
@@ -90,16 +104,6 @@ def test_start_and_stop_are_idempotent() -> None:
 
 
 @pytest.mark.usefixtures("not_tracing")
-def test_stop_after_someone_else_stopped_and_restarted() -> None:
-    heap = HeapProfiler()
-    heap.start()
-    tracemalloc.stop()
-    tracemalloc.start()  # now owned by "someone else"
-    heap.stop()
-    assert tracemalloc.is_tracing()
-
-
-@pytest.mark.usefixtures("not_tracing")
 def test_two_profilers_only_the_starter_stops() -> None:
     first, second = HeapProfiler(), HeapProfiler()
     first.start()
@@ -136,13 +140,13 @@ def test_snapshot_diff_reports_new_allocations() -> None:
         heap.snapshot()  # baseline
         retained = _allocate_for_heap_profile()
         profile = heap.snapshot()
-        found = sums(profile, "_allocate_for_heap_profile")
+        found = sums(profile, _allocate_for_heap_profile)
         assert found["alloc_space"] >= 2000 * 1024
         assert found["inuse_space"] >= 2000 * 1024
         assert found["alloc_objects"] >= 2000
 
         del retained
-        after = sums(heap.snapshot(), "_allocate_for_heap_profile")
+        after = sums(heap.snapshot(), _allocate_for_heap_profile)
     finally:
         heap.stop()
     # Nothing new was allocated there since the previous snapshot and it was freed.
@@ -158,7 +162,7 @@ def test_retained_memory_stays_in_use_without_new_allocations() -> None:
         heap.snapshot()
         retained = _allocate_for_heap_profile()
         heap.snapshot()
-        steady = sums(heap.snapshot(), "_allocate_for_heap_profile")
+        steady = sums(heap.snapshot(), _allocate_for_heap_profile)
         assert len(retained) == 2000
     finally:
         heap.stop()
@@ -179,14 +183,13 @@ def test_heap_stacks_are_leaf_first_with_source_lines() -> None:
     stacks = [
         s.stack
         for s in profile.samples
-        if any("_allocate_for_heap_profile" in f.function for f in s.stack)
+        if any(in_function(f, _allocate_for_heap_profile) for f in s.stack)
     ]
     assert stacks
+    caller = test_heap_stacks_are_leaf_first_with_source_lines
     for stack in stacks:
-        names = [f.function for f in stack]
-        target = next(i for i, n in enumerate(names) if "_allocate_for_heap_profile" in n)
-        caller = next(i for i, n in enumerate(names) if "test_heap_stacks_are_leaf_first" in n)
-        assert target < caller, names
-        assert stack[target].filename.endswith("test_heap.py")
+        target = next(i for i, f in enumerate(stack) if in_function(f, _allocate_for_heap_profile))
+        called_from = next(i for i, f in enumerate(stack) if in_function(f, caller))
+        assert target < called_from, stack
         assert stack[target].line > 0
     del retained

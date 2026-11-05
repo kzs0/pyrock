@@ -142,8 +142,8 @@ def frame_body(frame: Frame, /) -> bytes:
 
     Strips padding (``FLAG_PADDED``) and, for HEADERS, the priority fields
     (``FLAG_PRIORITY``). Other frame types return the payload unchanged.
-    Raises :class:`ProtocolError` when the pad length is not smaller than the
-    remaining payload.
+    Raises :class:`ProtocolError` when the payload is too short for the pad
+    length byte, the priority fields and the declared padding (RFC 9113 §6.1).
     """
     raise NotImplementedError
 

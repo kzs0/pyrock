@@ -11,8 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from pyrock.trace import SpanContext, TraceState
-from pyrock.trace import w3c
+from pyrock.trace import SpanContext, TraceState, w3c
 from pyrock.trace.w3c import InvalidTraceparent, InvalidTracestate
 
 TID = "0af7651916cd43dd8448eb211c80319c"

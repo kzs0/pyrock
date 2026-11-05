@@ -172,8 +172,8 @@ def test_span_context_validity() -> None:
     assert SpanContext(TID, SID).is_valid is True
     assert SpanContext(INVALID_TRACE_ID, SID).is_valid is False
     assert SpanContext(TID, INVALID_SPAN_ID).is_valid is False
-    assert INVALID_TRACE_ID == bytes(16)
-    assert INVALID_SPAN_ID == bytes(8)
+    assert bytes(16) == INVALID_TRACE_ID
+    assert bytes(8) == INVALID_SPAN_ID
 
 
 def test_span_context_is_frozen_and_hashable() -> None:

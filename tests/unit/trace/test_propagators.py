@@ -1,4 +1,4 @@
-"""Propagators (DESIGN §9.4): ``HTTPPropagator``, ``WSGIEnvironHeaders``, ``CompositePropagator``."""
+"""Propagators (DESIGN §9.4): HTTP, WSGI-environ adapter and composite."""
 
 from __future__ import annotations
 

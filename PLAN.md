@@ -300,3 +300,19 @@ These were decided during the phases and are binding for every later phase.
     - **The walker** is iterative, so depth 5000 must not raise
       `RecursionError`. Cycle and alias tracking is per call.
     - **`sanitize_url`** keeps the path and port and never raises.
+
+### From U2 (trace/otlp unit tests)
+
+35. **U2's choices are accepted as the contract**, as written in
+    `tests/unit/trace*`. Go parity applies wherever the docs are silent:
+    - **tracestate:** duplicate keys make `parse_tracestate` raise.
+    - **Empty batches:** exporters send nothing for an empty batch, and nothing
+      after shutdown.
+    - **Batch queue:** when full, the newest span is dropped. `failed` counts
+      export calls, not spans.
+    - **Retry classes:**
+      - HTTP 4xx other than 429 is a permanent failure.
+      - gRPC status 3, 7 and 16 are permanent.
+      - `H2Error` wraps connect failures and timeouts.
+    - **Span lifecycle:** spans ignore mutation after `end()`. Unsampled spans
+      never reach the processor.

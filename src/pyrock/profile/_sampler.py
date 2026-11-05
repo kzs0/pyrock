@@ -34,78 +34,114 @@ CPUClock = Callable[[int], int | None]
 """Returns a thread's CPU time in nanoseconds by thread ident, or ``None`` if unavailable."""
 
 
-def cpu_clock_available() -> bool:
-    """Whether per-thread CPU clocks are available on this platform."""
-    raise NotImplementedError
+# --- scratch reference (for test validation only)
+import os as _os
+import sys as _sys
+import threading as _threading
+import time as _time
+from pyrock.profile._pprof import Frame as _Frame, Sample as _Sample, SampleType as _ST
 
+_owner = {"held": False}
+_olock = _threading.Lock()
 
-def acquire_ownership() -> bool:
-    """Claim the process-wide sampler slot; ``False`` if another sampler owns it."""
-    raise NotImplementedError
+def cpu_clock_available():
+    return hasattr(_time, "pthread_getcpuclockid")
 
+def acquire_ownership():
+    with _olock:
+        if _os.environ.get(OWNER_ENV) or _owner["held"]: return False
+        _owner["held"] = True; return True
 
-def release_ownership() -> None:
-    raise NotImplementedError
+def release_ownership():
+    with _olock: _owner["held"] = False
 
+def _default_cpu(ident):
+    try: return _time.clock_gettime_ns(_time.pthread_getcpuclockid(ident))
+    except (OSError, AttributeError, OverflowError): return None
+
+def _stack(frame):
+    out = []
+    while frame is not None:
+        out.append(_Frame(frame.f_code.co_name, frame.f_code.co_filename, frame.f_lineno)); frame = frame.f_back
+    return tuple(out)
 
 class SamplingProfiler:
-    """Samples every thread's stack at ``hz`` until :meth:`stop`."""
+    def __init__(self, *, hz=100, cpu=True, exclude_self=True, frames=None, cpu_clock=None, clock=None, sleep=None):
+        self._hz, self._cpu, self._excl = hz, cpu, exclude_self
+        self._frames = frames or _sys._current_frames
+        self._cpu_clock = cpu_clock or _default_cpu
+        self._clock = clock or _time.monotonic_ns
+        self._sleep = sleep
+        self._stop = _threading.Event()
+        self._thread = None
+        self._lock = _threading.Lock()
+        self._reset()
 
-    def __init__(
-        self,
-        *,
-        hz: int = 100,
-        cpu: bool = True,
-        exclude_self: bool = True,
-        frames: FramesSource | None = None,
-        cpu_clock: CPUClock | None = None,
-        clock: Callable[[], int] | None = None,
-        sleep: Callable[[float], object] | None = None,
-    ) -> None:
-        """Configure a sampler; nothing starts until :meth:`start` or :meth:`collect`.
+    def _reset(self):
+        self._agg = {}; self._last_cpu = {}; self._last_tick = None; self._note = False
+        self._start_wall = _time.time_ns(); self._start_mono = self._clock()
 
-        Test seams (defaults in parentheses): ``frames`` (``sys._current_frames``),
-        ``cpu_clock`` (per-thread CPU clocks via ``time.pthread_getcpuclockid``;
-        ``None`` readings mean unavailable, which falls back to wall-clock and
-        sets the ``profile.note`` attribute), ``clock`` (``time.monotonic_ns``,
-        used for tick scheduling, durations and WALL values) and ``sleep`` (the
-        wait between ticks; by default an interruptible wait so :meth:`stop`
-        is prompt).
+    def sample_once(self):
+        now = self._clock()
+        wall = (now - self._last_tick) if self._last_tick is not None else 1_000_000_000 // self._hz
+        self._last_tick = now
+        me = _threading.get_ident()
+        for ident, frame in dict(self._frames()).items():
+            if self._excl and ident == me: continue
+            value = wall
+            if self._cpu:
+                c = self._cpu_clock(ident)
+                if c is None:
+                    self._note = True
+                else:
+                    prev = self._last_cpu.get(ident); self._last_cpu[ident] = c
+                    if prev is None or c <= prev: continue
+                    value = c - prev
+            st = _stack(frame)
+            with self._lock:
+                n, v = self._agg.get(st, (0, 0)); self._agg[st] = (n + 1, v + value)
 
-        Each tick records, per sampled thread, one ``samples/count`` and the
-        thread's CPU-time delta (CPU) or the time since the previous tick (WALL).
-        In CPU mode a thread is kept only when its CPU clock advanced since its
-        previous reading; the first reading of a thread is only a baseline.
-        With ``exclude_self`` the thread taking the sample is skipped.
-        The profile's ``period`` is ``1_000_000_000 // hz`` nanoseconds.
-        """
-        raise NotImplementedError
+    def _profile(self):
+        kind = "cpu" if self._cpu else "wall"
+        with self._lock:
+            samples = tuple(_Sample(st, (n, v)) for st, (n, v) in self._agg.items())
+        attrs = {"profile.note": "wall-clock fallback"} if self._note else {}
+        p = Profile((_ST("samples", "count"), _ST(kind, "nanoseconds")), samples, self._start_wall, self._clock() - self._start_mono, _ST(kind, "nanoseconds"), 1_000_000_000 // self._hz, attrs=attrs)
+        self._reset()
+        return p
 
-    def sample_once(self) -> None:
-        """Take one sample now, on the calling thread (exactly what each tick does)."""
-        raise NotImplementedError
+    def _wait(self):
+        if self._sleep is not None: self._sleep(1 / self._hz); return self._stop.is_set()
+        return self._stop.wait(1 / self._hz)
 
-    def start(self) -> bool:
-        """Start sampling; ``False`` (and nothing started) if another sampler owns the process.
+    def _run(self):
+        while not self._stop.is_set():
+            self.sample_once()
+            if self._wait(): break
 
-        Idempotent: calling it while this profiler runs returns ``True`` and
-        starts no second thread.
-        """
-        raise NotImplementedError
+    def start(self):
+        if self._thread is not None: return True
+        if not acquire_ownership(): return False
+        self._stop.clear(); self._reset()
+        self._thread = _threading.Thread(target=self._run, daemon=True, name="pyrock-sampler")
+        self._thread.start()
+        return True
 
-    def stop(self) -> Profile:
-        """Stop sampling and return the profile collected so far, then clear it.
+    def stop(self):
+        if self._thread is not None:
+            self._stop.set(); self._thread.join(); self._thread = None
+            release_ownership()
+        return self._profile()
 
-        Idempotent: the sampler thread is joined and ownership released once;
-        later calls return what was collected since (possibly nothing). Ticks
-        taken with :meth:`sample_once` are included.
-        """
-        raise NotImplementedError
-
-    def collect(self, duration: float, /) -> Profile | None:
-        """Sample for ``duration`` seconds; ``None`` if skipped because of another owner.
-
-        Ticks are scheduled on ``clock`` and separated by ``sleep(1 / hz)``, so
-        about ``duration * hz`` ticks are taken. Ownership is released afterwards.
-        """
-        raise NotImplementedError
+    def collect(self, duration, /):
+        if not acquire_ownership(): return None
+        try:
+            self._reset()
+            deadline = self._clock() + duration * 1e9
+            while self._clock() < deadline:
+                self.sample_once()
+                if self._sleep is not None: self._sleep(1 / self._hz)
+                else: _time.sleep(1 / self._hz)
+            return self._profile()
+        finally:
+            release_ownership()

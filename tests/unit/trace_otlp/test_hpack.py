@@ -34,7 +34,7 @@ from pyrock.trace.otlp._h2 import (
         (127, 7, 0, "7f00"),
         (128, 7, 0, "7f01"),
         (4096, 5, 0x20, "3fe11f"),
-        (2**21, 4, 0, "0ff1ffff00"),
+        (2**21, 4, 0, "0ff1ff7f"),
     ],
 )
 def test_encode_integer(value: int, prefix: int, first_byte: int, expected: str) -> None:
@@ -238,19 +238,27 @@ RESP_TABLES = [
 ]
 
 C5 = [
-    "4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d54"
-    "6e1768747470733a2f2f7777772e6578616d706c652e636f6d",
+    (
+        "4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d54"
+        "6e1768747470733a2f2f7777772e6578616d706c652e636f6d"
+    ),
     "4803333037c1c0bf",
-    "88c1611d4d6f6e2c203231204f637420323031332032303a31333a323220474d54c05a04677a69707738666f6f"
-    "3d4153444a4b48514b425a584f5157454f50495541585157454f49553b206d61782d6167653d333630303b2076"
-    "657273696f6e3d31",
+    (
+        "88c1611d4d6f6e2c203231204f637420323031332032303a31333a323220474d54c05a04677a69707738666f6f"
+        "3d4153444a4b48514b425a584f5157454f50495541585157454f49553b206d61782d6167653d333630303b2076"
+        "657273696f6e3d31"
+    ),
 ]
 C6 = [
-    "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f"
-    "0b97c8e9ae82ae43d3",
+    (
+        "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f"
+        "0b97c8e9ae82ae43d3"
+    ),
     "4883640effc1c0bf",
-    "88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335df"
-    "dfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007",
+    (
+        "88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335df"
+        "dfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007"
+    ),
 ]
 
 
@@ -414,7 +422,6 @@ def test_decoder_errors(block: str) -> None:
 
 def test_decoder_huffman_name_and_value() -> None:
     # Literal without indexing, new Huffman-coded name and value.
-    block = bytes.fromhex("00") + bytes([0x80 | 4]) + bytes.fromhex("9acac9") + b"\x00"
     block = bytes.fromhex("00") + bytes([0x83]) + bytes.fromhex("9acac9") + bytes([0x81, 0x07])
     assert HPACKDecoder().decode(block) == [("grpc", "0")]
 
@@ -424,6 +431,71 @@ def test_decoder_empty_block() -> None:
 
 
 # --------------------------------------------------------------- encoder
+
+STATIC_NAMES = [
+    ":authority",
+    ":method",
+    ":method",
+    ":path",
+    ":path",
+    ":scheme",
+    ":scheme",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    "accept-charset",
+    "accept-encoding",
+    "accept-language",
+    "accept-ranges",
+    "accept",
+    "access-control-allow-origin",
+    "age",
+    "allow",
+    "authorization",
+    "cache-control",
+    "content-disposition",
+    "content-encoding",
+    "content-language",
+    "content-length",
+    "content-location",
+    "content-range",
+    "content-type",
+    "cookie",
+    "date",
+    "etag",
+    "expect",
+    "expires",
+    "from",
+    "host",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "last-modified",
+    "link",
+    "location",
+    "max-forwards",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "range",
+    "referer",
+    "refresh",
+    "retry-after",
+    "server",
+    "set-cookie",
+    "strict-transport-security",
+    "transfer-encoding",
+    "user-agent",
+    "vary",
+    "via",
+    "www-authenticate",
+]
+assert len(STATIC_NAMES) == 61
 
 
 def _parse_literals(block: bytes) -> list[tuple[str, str]]:
@@ -439,7 +511,7 @@ def _parse_literals(block: bytes) -> list[tuple[str, str]]:
         i += n
         return text
 
-    static = {1: ":authority", 2: ":method", 4: ":path", 6: ":scheme", 31: "content-type"}
+    static = dict(enumerate(STATIC_NAMES, start=1))
     while i < len(block):
         assert block[i] & 0xF0 == 0x00, f"not literal-without-indexing: {block[i]:#x}"
         index, i = decode_integer(block, i, 4)

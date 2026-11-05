@@ -261,9 +261,7 @@ ANY_VALUES = [
     pytest.param(
         datetime.timedelta(seconds=5), ref.any_double(5000.0), id="timedelta-is-double-ms"
     ),
-    pytest.param(
-        ["a", "b"], ref.any_array(ref.any_str("a"), ref.any_str("b")), id="str-sequence"
-    ),
+    pytest.param(["a", "b"], ref.any_array(ref.any_str("a"), ref.any_str("b")), id="str-sequence"),
     pytest.param((1, 2), ref.any_array(ref.any_int(1), ref.any_int(2)), id="int-tuple"),
     pytest.param(
         [True, False], ref.any_array(ref.any_bool(True), ref.any_bool(False)), id="bool-list"
@@ -335,7 +333,9 @@ def _expected_golden_span() -> bytes:
             ref.ld(9, ref.kv("n", ref.any_int(7))),
             ref.ld(
                 11,
-                ref.f64(1, 1_500_000_000) + ref.ld(2, "ev") + ref.ld(3, ref.kv("b", ref.any_bool(True))),
+                ref.f64(1, 1_500_000_000)
+                + ref.ld(2, "ev")
+                + ref.ld(3, ref.kv("b", ref.any_bool(True))),
             ),
             ref.ld(15, ref.ld(2, "boom") + ref.vfield(3, 2)),
         ]
@@ -433,7 +433,9 @@ def test_export_trace_request_decodes_with_official_schema() -> None:
     assert span["start_time_unix_nano"] == 1_000_000_000
     assert span["end_time_unix_nano"] == 2_000_000_000
     assert span["attributes"] == {"k": "v", "n": 7}
-    assert span["events"] == [{"name": "ev", "time_unix_nano": 1_500_000_000, "attributes": {"b": True}}]
+    assert span["events"] == [
+        {"name": "ev", "time_unix_nano": 1_500_000_000, "attributes": {"b": True}}
+    ]
     assert span["status_code"] == 2
     assert span["status_message"] == "boom"
     assert span["resource"] == {"service.name": "svc", "env": "prod"}

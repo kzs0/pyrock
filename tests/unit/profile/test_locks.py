@@ -314,9 +314,9 @@ def test_condition_notify_all_wakes_every_waiter() -> None:
     go: list[bool] = []
 
     def waiter(i: int) -> None:
+        ready.wait(5)
         with cond:
-            ready.wait(5)
-            cond.wait_for(lambda: go, timeout=5)
+            assert cond.wait_for(lambda: go, timeout=5)
             woken.append(i)
 
     threads = [threading.Thread(target=waiter, args=(i,)) for i in range(3)]
