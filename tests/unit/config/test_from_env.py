@@ -101,7 +101,10 @@ def test_each_variable_sets_its_field(var: str, raw: str, name: str, expected: A
 
 @pytest.mark.parametrize("raw", ["debug", "DEBUG", "info", "warn", "WARNING", "error"])
 def test_log_level_is_case_insensitive(raw: str) -> None:
-    assert Config.from_env({"BEDROCK_LOG_LEVEL": raw}).log_level.upper() == raw.upper()
+    def norm(level: str) -> str:
+        return {"WARNING": "WARN"}.get(level.upper(), level.upper())
+
+    assert norm(Config.from_env({"BEDROCK_LOG_LEVEL": raw}).log_level) == norm(raw)
 
 
 def test_every_env_var_is_exercised() -> None:

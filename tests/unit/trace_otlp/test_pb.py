@@ -209,7 +209,7 @@ def test_writer_packed_varints() -> None:
     assert w.getvalue().hex() == "2206038e029ea705"
 
 
-def test_writer_packed_varints_empty_and_negative() -> None:
+def test_writer_packed_varints_negative() -> None:
     w = Writer()
     w.packed_varints(1, [-1])
     assert w.getvalue() == ref.ld(1, ref.varint(-1))

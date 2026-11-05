@@ -279,3 +279,24 @@ These were decided during the phases and are binding for every later phase.
       static attrs, record attrs, `trace_id`, `span_id`, `logger`.
       Empty IDs are omitted.
     - **Runtime metric families** take the registry prefix.
+
+### From U1 (attr/env/config/privacy unit tests)
+
+34. **U1's assumptions are accepted as the contract.** The tests in
+    `tests/unit/{attr,env,config,privacy}` define it. The rules:
+    - **Error keys:** flat `error`, `error.type` and `error.fingerprint`
+      survive the default policy. `error.message`, `exception.*` and nested
+      error groups are private.
+    - **`error.stack`** needs both `allow_error_details` and
+      `allow_source_paths`.
+    - **Exception groups:** `error.group.count` and `error.types` count leaf
+      exceptions.
+    - **Durations:** `parse_duration` rejects nan, inf and exponents.
+      Negative values are rejected by `Config` validation.
+    - **Allowlists:** a group entry admits the nested values under it. A leaf
+      entry filters its parent group down to that child.
+    - **`resource_keys`** adds to the defaults. Resource keys that aren't
+      infrastructure pass by default.
+    - **The walker** is iterative, so depth 5000 must not raise
+      `RecursionError`. Cycle and alias tracking is per call.
+    - **`sanitize_url`** keeps the path and port and never raises.

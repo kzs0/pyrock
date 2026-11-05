@@ -70,9 +70,6 @@ def kv(key: str, any_value: bytes) -> bytes:
     return ld(1, key) + ld(2, any_value)
 
 
-Field = tuple[int, int, "int | bytes"]
-
-
 def parse(buf: bytes) -> list[tuple[int, int, int | bytes]]:
     """Decode one message level into ``(field, wire_type, value)`` triples."""
     out: list[tuple[int, int, int | bytes]] = []
