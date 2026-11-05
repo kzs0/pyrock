@@ -340,3 +340,26 @@ two:
   runs alongside I3 (`metric`, `prometheus`, `runtime`).
 
 Waves 3b–3d are unchanged.
+
+## Interface notes (between implementation agents)
+
+### `trace/otlp/_h2` (from I4)
+
+- **Construction:** `H2Connection(host, port, *, ssl_context=None,
+  server_hostname=None, connect_timeout=10.0)` connects **immediately**, so
+  exporters must create it lazily on first use.
+- **Requests:** `conn.request(method, path, headers, body, timeout=)` returns
+  `H2Response`, which has `.status`, `.header(name)` and `.body`. The client
+  builds the pseudo-headers itself. A non-200 status is returned in the
+  response, not raised.
+- **Errors:**
+  - Every failure is an `H2Error`.
+  - `StreamReset` means only that stream failed; the connection is still
+    usable.
+  - `ProtocolError` means the connection was torn down.
+  - After any `H2Error` other than `StreamReset`, check `conn.closed` and
+    reconnect if it is true. A timeout leaves the connection open, so it is
+    reused.
+- **Concurrency:** calls are serialised by a lock (see the design note in the
+  module).
+- **TLS:** a passed `ssl_context` gets ALPN `["h2"]` set on it.
