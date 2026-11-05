@@ -19,8 +19,7 @@ A second ``operation("fetch")`` under the same parent is named ``fetch[1]``,
 then ``fetch[2]``; numbering applies to span names only. Operations inside a
 source are prefixed with the source name.
 
-Note: ``pyrock.operation`` (the attribute) is the :func:`operation` function;
-the classes in this module are re-exported from ``pyrock``.
+This module is private; its public names are re-exported from ``pyrock``.
 """
 
 from __future__ import annotations

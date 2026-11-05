@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from pyrock._operation import Operation, OperationScope, Source, SourceScope, Step, StepScope
 from pyrock.metric import Counter, Gauge, Histogram
-from pyrock.operation import Operation, OperationScope, Source, SourceScope, Step, StepScope
 
 if TYPE_CHECKING:
     from pyrock._bedrock import Bedrock

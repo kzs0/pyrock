@@ -17,10 +17,9 @@ under :data:`ATTRS_KEY`; other ``extra`` keys also become structured fields.
 All fields pass through the privacy policy. ``exc_info`` becomes ``error.*``
 fields.
 
-The module is also callable: ``pyrock.log(logging.INFO, "msg", ...)`` is the
-top-level helper (wired up by ``pyrock/__init__``).
+The top-level ``pyrock.log(level, msg, ...)`` helper lives in ``pyrock`` itself.
 
-Import rules: ``pyrock.log`` imports only ``pyrock.attr``, ``pyrock.trace`` and
+Import rules: ``pyrock.logs`` imports only ``pyrock.attr``, ``pyrock.trace`` and
 ``pyrock.privacy`` from pyrock.
 """
 

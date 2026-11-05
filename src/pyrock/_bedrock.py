@@ -12,23 +12,23 @@ from collections.abc import Iterable, Mapping, MutableMapping, Sequence
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from pyrock.attr import AttrValue
-from pyrock.config import Config
-from pyrock.metric import Counter, Gauge, Histogram, Registry
-from pyrock.operation import (
+from pyrock._operation import (
     Operation,
     OperationScope,
     RegisterItem,
     SourceScope,
     StepScope,
 )
+from pyrock.attr import AttrValue
+from pyrock.config import Config
+from pyrock.metric import Counter, Gauge, Histogram, Registry
 from pyrock.trace import Span, SpanContext, SpanKind, Tracer
 from pyrock.trace.otlp.batch import BatchStats
 
 if TYPE_CHECKING:
     import asyncio
 
-    from pyrock.cloud import CloudConfig
+    from pyrock._cloud import CloudConfig
     from pyrock.profile import ProfileExportConfig, ProfileExporter, ProfileExportStats
 
 __all__ = [

@@ -110,7 +110,7 @@ pyrock/
 ├── config.py            # Config dataclass, from_env(), default()
 ├── env.py               # Env marker, parse(dataclass_type) -> instance
 ├── attr.py              # AttrValue typing, Event, error normalization, Attrs (ordered, deduped)
-├── operation.py         # Operation, Step, Source (context managers + decorators)
+├── _operation.py        # Operation, Step, Source (context managers + decorators)
 ├── trace/
 │   ├── __init__.py      # Tracer, Span, SpanContext, SpanKind, current_span()
 │   ├── sampler.py       # Sampler Protocol, AlwaysOn, AlwaysOff, Ratio, ParentBased
@@ -127,13 +127,13 @@ pyrock/
 │   ├── __init__.py      # Registry, Counter, Gauge, Histogram, label-bound children
 │   ├── runtime.py       # RuntimeCollector (gc, threads, rusage, RSS, fds, asyncio)
 │   └── prometheus.py    # Text exposition encode() + validation
-├── log.py               # BedrockHandler, JSONFormatter, CorrelationFilter, canonical log
+├── logs.py              # BedrockHandler, JSONFormatter, CorrelationFilter, canonical log
 ├── privacy.py           # Policy dataclass + enforcement walker
 ├── server.py            # Observability server (ThreadingHTTPServer, hardened)
 ├── wsgi.py              # WSGI middleware
 ├── asgi.py              # ASGI 3 middleware (http + lifespan passthrough)
 ├── http.py              # urllib TracingHandler, request/get/post, inject_headers
-├── cloud.py             # cloud() option, retry + fan-out exporters, wiring
+├── _cloud.py            # cloud() option, retry + fan-out exporters, wiring
 ├── _envdetect.py        # process/git/k8s/container/AWS/GCP detection
 ├── _push.py             # metrics push loop
 ├── profile/
@@ -149,14 +149,14 @@ pyrock/
 ```
 
 Import rules mirror Go. `attr`, `env` and `privacy` import nothing from pyrock.
-`trace` imports `attr`. `metric` imports `attr`. `log` imports `attr` and
-`trace`. Only the top-level modules (`_bedrock`, `operation`, `wsgi`, `asgi`,
-`http`, `cloud`) see everything. A test enforces this, as
+`trace` imports `attr`. `metric` imports `attr`. `logs` imports `attr` and
+`trace`. Only the top-level modules (`_bedrock`, `_operation`, `wsgi`, `asgi`,
+`http`, `_cloud`) see everything. A test enforces this, as
 `dependency_boundary_test.go` does in Go, by walking the AST of each module.
 The same test asserts that every `import` resolves to the stdlib
 (`sys.stdlib_module_names`).
 
-Heavy modules (`profile`, `cloud`, `trace.otlp.grpc`) load lazily so
+Heavy modules (`profile`, `_cloud`, `trace.otlp.grpc`) load lazily so
 `import pyrock` stays cheap (target: under 15 ms).
 
 ---
@@ -627,13 +627,13 @@ pyrock builds on stdlib `logging` rather than adding a parallel logger.
 
 **What `init()` installs** depends on `log_install`:
 
-- `"root"` (default): installs a `pyrock.log.BedrockHandler` on the root logger
+- `"root"` (default): installs a `pyrock.logs.BedrockHandler` on the root logger
   with `JSONFormatter` (or `TextFormatter`) and sets the level. All of your
   existing `logging.getLogger(__name__).info(...)` calls, and those of your
   libraries, become structured and trace-correlated. The previous root handlers
   and level are saved and restored on `shutdown()`.
 - `"pyrock"`: configures only the `pyrock` logger. Use this when the app owns
-  logging config (Django `LOGGING`, `dictConfig`). Add `pyrock.log.CorrelationFilter`
+  logging config (Django `LOGGING`, `dictConfig`). Add `pyrock.logs.CorrelationFilter`
   to your own handlers to get `trace_id`, `span_id` and static attrs.
 - `"none"`: installs nothing.
 

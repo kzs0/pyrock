@@ -92,7 +92,7 @@ BOUNDARIES: dict[str, set[str] | None] = {
     # services
     "trace": {"attr", "privacy", *UTILITY},
     "metric": {"attr", "privacy", *UTILITY},
-    "log": {"attr", "trace", "privacy", *UTILITY},
+    "logs": {"attr", "trace", "privacy", *UTILITY},
     "server": {"metric", *UTILITY},
     "profile": {"attr", "privacy", "trace", *UTILITY},
     "config": {"env", "privacy", "trace", "profile", *UTILITY},
@@ -103,11 +103,11 @@ BOUNDARIES: dict[str, set[str] | None] = {
     "_bedrock": None,
     "_context": None,
     "_noop": None,
-    "operation": None,
+    "_operation": None,
     "wsgi": None,
     "asgi": None,
     "http": None,
-    "cloud": None,
+    "_cloud": None,
     "testing": None,
 }
 
@@ -147,7 +147,7 @@ def test_every_module_imports(name: str) -> None:
 
 LAZY_MODULES = (
     "pyrock.profile",
-    "pyrock.cloud",
+    "pyrock._cloud",
     "pyrock.trace.otlp.grpc",
     "pyrock.trace.otlp._h2",
     "pyrock.wsgi",
@@ -183,7 +183,7 @@ def test_import_pyrock_is_lazy() -> None:
 
 def test_lazy_attributes_load_on_demand() -> None:
     loaded = _loaded_after("import pyrock\npyrock.CloudConfig\npyrock.wsgi")
-    assert "pyrock.cloud" in loaded
+    assert "pyrock._cloud" in loaded
     assert "pyrock.wsgi" in loaded
     assert "pyrock.trace.otlp.grpc" not in loaded
     assert "pyrock.trace.otlp._h2" not in loaded
@@ -253,20 +253,27 @@ def test_module_all_resolves(name: str) -> None:
     assert len(names) == len(set(names))
 
 
-def test_dual_function_module_names() -> None:
+def test_no_public_name_collides_with_a_submodule() -> None:
+    """A top-level function must never share its name with a submodule.
+
+    Importing ``pyrock.<name>`` would rebind the attribute to the module.
+    """
+    submodules = {name.split(".")[1] for name in MODULES if name.count(".") >= 1}
+    clashes = sorted(set(pyrock.__all__) & submodules)
+    assert not clashes, f"public names shadowed by submodules: {clashes}"
+
+
+def test_helpers_stay_functions_after_private_modules_load() -> None:
     import logging
+    import types
 
-    import pyrock.log
+    import pyrock._cloud
+    import pyrock._operation
+    import pyrock.logs
 
-    # pyrock.log is both the log helper and the module
-    assert callable(pyrock.log)
-    assert pyrock.log.CorrelationFilter is not None
-    assert issubclass(pyrock.log.CorrelationFilter, logging.Filter)
-    # pyrock.operation is the function; the classes are top-level
-    assert callable(pyrock.operation)
-    assert not isinstance(pyrock.operation, type(sys))
-    # pyrock.cloud is callable and exposes CloudConfig
-    assert callable(pyrock.cloud)
+    for name in ("log", "operation", "cloud", "step", "source", "init"):
+        assert isinstance(getattr(pyrock, name), types.FunctionType), name
+    assert issubclass(pyrock.logs.CorrelationFilter, logging.Filter)
     cfg = pyrock.cloud("brk_test_key")
     assert isinstance(cfg, pyrock.CloudConfig)
     assert "brk_test_key" not in repr(cfg)

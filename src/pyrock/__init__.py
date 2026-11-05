@@ -12,10 +12,8 @@
 Importing ``pyrock`` is cheap: profiling, cloud, gRPC, the server, the HTTP
 client and the WSGI/ASGI middleware load on first use.
 
-``pyrock.log`` and ``pyrock.cloud`` are both functions and submodules: the
-modules are callable, so ``pyrock.log(logging.INFO, "msg")`` and
-``pyrock.log.CorrelationFilter`` both work. ``pyrock.operation`` is the
-function; the classes of :mod:`pyrock.operation` are re-exported here.
+Logging integration classes (``BedrockHandler``, ``CorrelationFilter``, ...)
+live in :mod:`pyrock.logs`; ``pyrock.log(level, msg, ...)`` is the helper.
 """
 
 from __future__ import annotations
@@ -37,19 +35,14 @@ from pyrock._bedrock import (
     info,
     init,
     inject_headers,
+    log,
     register,
     track_loop,
     warn,
     warning,
 )
-from pyrock._compat import make_module_callable
 from pyrock._context import ContextThreadPoolExecutor, Thread, bind
-from pyrock._version import __version__ as __version__
-from pyrock.attr import AttrValue, Event
-from pyrock.config import Config, ConfigError
-
-# Bound after pyrock.operation (the submodule) is loaded, so the name is the function.
-from pyrock.operation import (
+from pyrock._operation import (
     Operation,
     OperationScope,
     Source,
@@ -61,18 +54,14 @@ from pyrock.operation import (
     start_operation,
     step,
 )
+from pyrock._version import __version__ as __version__
+from pyrock.attr import AttrValue, Event
+from pyrock.config import Config, ConfigError
 from pyrock.trace import SpanContext, SpanKind
 
 if TYPE_CHECKING:
-    from pyrock._bedrock import log as log
-    from pyrock.cloud import CloudConfig as CloudConfig
-    from pyrock.cloud import cloud as cloud
-else:
-    from pyrock import _bedrock as _bedrock_module
-    from pyrock import log
-
-    make_module_callable("pyrock.log", _bedrock_module.log)
-    del _bedrock_module
+    # Lazily loaded on first attribute access (see __getattr__ below).
+    from pyrock._cloud import CloudConfig, cloud
 
 __all__ = [
     "AttrValue",
@@ -118,11 +107,12 @@ __all__ = [
 
 # name -> (module, attribute or None for the module itself)
 _LAZY: dict[str, tuple[str, str | None]] = {
-    "CloudConfig": ("pyrock.cloud", "CloudConfig"),
-    "cloud": ("pyrock.cloud", None),
+    "CloudConfig": ("pyrock._cloud", "CloudConfig"),
+    "cloud": ("pyrock._cloud", "cloud"),
     "asgi": ("pyrock.asgi", None),
     "env": ("pyrock.env", None),
     "http": ("pyrock.http", None),
+    "logs": ("pyrock.logs", None),
     "profile": ("pyrock.profile", None),
     "server": ("pyrock.server", None),
     "testing": ("pyrock.testing", None),

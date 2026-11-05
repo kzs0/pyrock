@@ -14,8 +14,9 @@
   shutdown.
 * Profile push: OTLP profiles to ``{endpoint}/v1/profiles``.
 
-This module is callable: ``pyrock.cloud(...)`` is :func:`cloud`. It is never
-imported by ``import pyrock``; the gRPC stack loads only when wiring starts.
+``pyrock.cloud`` and ``pyrock.CloudConfig`` are re-exported (lazily) from this
+private module. It is never imported by ``import pyrock``; the gRPC stack loads
+only when wiring starts.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from pyrock._compat import is_nonempty_str, make_module_callable, seconds
+from pyrock._compat import is_nonempty_str, seconds
 from pyrock.profile import DEFAULT_PROFILE_TYPES, ProfileType
 from pyrock.trace import Span, SpanExporter
 
@@ -157,6 +158,3 @@ class CloudWiring:
 def wire(bedrock: Bedrock, config: CloudConfig, /) -> CloudWiring:
     """Replace the batch processor and start metrics and profile push for ``bedrock``."""
     raise NotImplementedError
-
-
-make_module_callable(__name__, cloud)

@@ -111,7 +111,7 @@ private internals.
 | U3 | `metric` (registry, types, limits), `prometheus`, `runtime`, `log` |
 | U4 | `profile` (sampler, heap, stacks, locks, pprof and OTLP encoders, export, debug), `server` |
 
-The core modules (`operation`, `_bedrock`, `wsgi`, `asgi`, `http`, `cloud`) are
+The core modules (`_operation`, `_bedrock`, `wsgi`, `asgi`, `http`, `_cloud`) are
 covered mainly by E2E tests. U-agents add component tests for them only when
 the logic can be isolated.
 
@@ -131,9 +131,9 @@ is wrong, it reports this, and the orchestrator decides.
 | Wave | Agents (parallel within a wave) |
 |---|---|
 | 3a leaves | I1 `attr`, `env`, `config`, `privacy` · I2 `trace` core + `trace/otlp` (`_pb`, http, batch) · I3 `metric` + `prometheus` + `runtime` · I4 `trace/otlp/_h2` + grpc exporter |
-| 3b services | I5 `log` · I6 `server` · I7 `profile/*` |
-| 3c core | I8 `_context`, `_noop`, `_bedrock`, `operation`, `__init__`, `testing`, `_envdetect`, fork hook |
-| 3d integrations | I9 `wsgi`, `asgi`, `http` · I10 `cloud`, `_push`, profile push wiring |
+| 3b services | I5 `logs` · I6 `server` · I7 `profile/*` |
+| 3c core | I8 `_context`, `_noop`, `_bedrock`, `_operation`, `__init__`, `testing`, `_envdetect`, fork hook |
+| 3d integrations | I9 `wsgi`, `asgi`, `http` · I10 `_cloud`, `_push`, profile push wiring |
 
 The orchestrator commits after each wave and pushes.
 

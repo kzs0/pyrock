@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, overload
 
 if TYPE_CHECKING:
     from pyrock._bedrock import Bedrock
-    from pyrock.operation import Operation, Source, Step
+    from pyrock._operation import Operation, Source, Step
 
 __all__ = [
     "ContextThreadPoolExecutor",
