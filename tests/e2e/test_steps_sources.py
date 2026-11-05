@@ -12,7 +12,7 @@ import pytest
 
 import pyrock
 from pyrock.testing import capture
-from tests.e2e._core_helpers import isolated, prom_text, quiet, run, spans_named
+from tests.e2e._core_helpers import isolated, prom_text, quiet, run
 from tests.support.collectors import OTLPHTTPCollector
 
 # -- steps --------------------------------------------------------------------
@@ -241,6 +241,17 @@ def test_source_aggregates_use_prefixed_names_and_source_labels() -> None:
     assert exposition.type("background_worker_latency_ms") == "histogram"
     assert exposition.value("background_worker_latency_ms_count", labels) == 1
     assert exposition.value("background_worker_latency_ms_sum", labels) == pytest.approx(52.3)
+    # pyrock.testing filters accept a positional mapping for dotted keys.
+    assert t.metrics.value("background_worker_jobs_processed", {"worker.type": "async"}) == 3
+
+
+def test_direct_children_of_a_source_are_never_numbered() -> None:
+    with capture() as t, pyrock.source("consumer"):
+        for _ in range(3):
+            with pyrock.operation("handle"):
+                pass
+    assert t.spans.names() == ["consumer.handle"] * 3
+    assert t.metrics.value("consumer_handle_count") == 3
 
 
 def test_source_sum_defaults_to_one() -> None:
@@ -298,7 +309,7 @@ def test_source_decorator_on_coroutine_function() -> None:
                     await asyncio.sleep(0)
 
         run(run_consumer())
-    spans = spans_named(t, "consumer.handle")
+    spans = t.spans.find(name="consumer.handle")
     assert len(spans) == 2
     assert all(span.attrs["queue"] == "jobs" for span in spans)
     assert t.metrics.value("consumer_handle_count") == 2

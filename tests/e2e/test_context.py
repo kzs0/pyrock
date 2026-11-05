@@ -6,6 +6,7 @@ DESIGN.md §2.1, §4.6, §4.7; PLAN.md decision 2 (no monkey-patching of threads
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import sys
 import threading
 from typing import Any
@@ -14,7 +15,7 @@ import pytest
 
 import pyrock
 from pyrock.testing import capture
-from tests.e2e._core_helpers import isolated, run, spans_named
+from tests.e2e._core_helpers import isolated, run
 
 THREADS_INHERIT_CONTEXT = bool(getattr(sys.flags, "thread_inherit_context", 0))
 """3.14 free-threaded builds start threads with a copy of the caller's context."""
@@ -203,7 +204,7 @@ def test_plain_thread_does_not_inherit_context() -> None:
         thread.start()
         thread.join(5)
     assert seen == {"noop": True, "operation": None, "trace_id": None}
-    assert spans_named(t, "orphan") == []
+    assert t.spans.find(name="orphan") == []
     assert t.metrics.value("orphan_count") is None
 
 
@@ -270,8 +271,8 @@ def test_context_thread_pool_executor_copies_context_on_submit_and_map() -> None
     assert submitted["operation"] == "parent"
     assert submitted["trace_id"] == parent.trace_id
     assert len(mapped) == 3
-    children = spans_named(t, "mapped")
-    assert len(children) == 3
+    children = [span for span in t.spans if span.name.startswith("mapped")]
+    assert sorted(child.name for child in children) == ["mapped", "mapped[1]", "mapped[2]"]
     assert all(child.parent_span_id == parent.span_id for child in children)
 
 
@@ -288,6 +289,17 @@ def test_pyrock_thread_runs_target_in_creators_context() -> None:
         thread.join(5)
     assert seen["operation"] == "parent"
     assert seen["label"] == "x"
+
+
+def test_pyrock_thread_accepts_an_explicit_context() -> None:
+    seen: dict[str, Any] = {}
+    with capture():
+        with pyrock.operation("captured"):
+            context = contextvars.copy_context()
+        thread = pyrock.Thread(target=lambda: seen.update(_observe()), context=context)
+        thread.start()
+        thread.join(5)
+    assert seen["operation"] == "captured"
 
 
 def test_concurrent_thread_operations_are_all_counted() -> None:
@@ -308,3 +320,5 @@ def test_concurrent_thread_operations_are_all_counted() -> None:
             thread.join(30)
     assert t.metrics.value("parallel_count", kind="t") == workers * per_worker
     assert t.metrics.value("parallel_successes", kind="t") == workers * per_worker
+    # Root operations are never numbered, whichever thread opens them.
+    assert set(t.spans.names()) == {"parallel"}

@@ -66,19 +66,3 @@ def prom_text(capture: Any) -> PromText:
 def count(value: float | None) -> float:
     """A counter value where an absent series means zero (Go only creates hit series)."""
     return 0.0 if value is None else value
-
-
-def span_attr_or_resource(span: dict[str, Any], key: str) -> Any:
-    """Static attrs are exported as resource attrs (Go) or span attrs; accept either."""
-    if key in span["resource"]:
-        return span["resource"][key]
-    return span["attributes"].get(key)
-
-
-def spans_named(capture: Any, base: str) -> list[Any]:
-    """Captured spans named ``base`` or a numbered duplicate ``base[n]``.
-
-    Root-level duplicates may or may not be numbered (numbering is per parent),
-    so tests that repeat a root operation match both forms.
-    """
-    return [s for s in capture.spans if s.name == base or s.name.startswith(base + "[")]

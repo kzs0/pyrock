@@ -9,13 +9,14 @@ import asyncio
 import contextlib
 import datetime
 import inspect
+import re
 from collections.abc import AsyncIterator, Iterator
 
 import pytest
 
 import pyrock
 from pyrock.testing import capture
-from tests.e2e._core_helpers import count, isolated, prom_text, quiet, run, spans_named
+from tests.e2e._core_helpers import count, isolated, prom_text, quiet, run
 from tests.support.collectors import OTLPHTTPCollector
 
 
@@ -190,8 +191,7 @@ def test_error_fingerprint_is_stable_across_calls_and_distinguishes_sites() -> N
     first = t.spans.one(name="a").attrs["error.fingerprint"]
     second = t.spans.one(name="b").attrs["error.fingerprint"]
     other = t.spans.one(name="c").attrs["error.fingerprint"]
-    assert isinstance(first, str)
-    assert first
+    assert re.fullmatch(r"[0-9a-f]{16}", first)
     assert first == second
     assert first != other
 
@@ -202,7 +202,10 @@ def test_error_chain_lists_wrapped_exception_types(explicit: bool) -> None:
         _raise_wrapped(explicit=explicit)
     attrs = t.spans.one(name="wrapped").attrs
     assert attrs["error.type"] == "builtins.RuntimeError"
-    assert "builtins.KeyError" in str(attrs["error.chain"])
+    chain = attrs["error.chain"]
+    assert isinstance(chain, list)
+    assert all(isinstance(item, str) for item in chain)
+    assert "builtins.KeyError" in chain
 
 
 def test_expected_exception_is_reraised_but_counts_as_success() -> None:
@@ -367,10 +370,13 @@ def test_exception_group_is_a_failure_summarizing_leaves() -> None:
         raise ExceptionGroup("several", [ValueError("a"), KeyError("b")])
     attrs = t.spans.one(name="batch").attrs
     assert t.spans.one(name="batch").failed
-    assert attrs["error.group.count"] == 2
-    types = str(attrs["error.types"])
-    assert "builtins.ValueError" in types
-    assert "builtins.KeyError" in types
+    count_attr = attrs["error.group.count"]
+    assert type(count_attr) is int
+    assert count_attr == 2
+    types = attrs["error.types"]
+    assert isinstance(types, list)
+    assert all(isinstance(item, str) for item in types)
+    assert sorted(types) == ["builtins.KeyError", "builtins.ValueError"]
 
 
 def test_exception_caught_by_parent_fails_only_the_child() -> None:
@@ -445,6 +451,25 @@ def test_numbering_is_per_parent() -> None:
     assert "fetch[1]" not in t.spans.names()
 
 
+def test_root_operations_are_never_numbered() -> None:
+    with capture() as t:
+        for _ in range(3):
+            with pyrock.operation("tick"):
+                pass
+    assert t.spans.names() == ["tick", "tick", "tick"]
+    assert t.metrics.value("tick_count") == 3
+
+
+def test_children_of_a_step_are_numbered() -> None:
+    with capture() as t, pyrock.operation("handle"), pyrock.step("helper"):
+        for _ in range(2):
+            with pyrock.operation("fetch"):
+                pass
+    helper = t.spans.one(name="helper")
+    assert t.spans.one(name="fetch").parent_span_id == helper.span_id
+    assert t.spans.one(name="fetch[1]").parent_span_id == helper.span_id
+
+
 def test_span_kind_defaults_to_internal_and_can_be_set() -> None:
     with capture() as t:
         with pyrock.operation("internal"):
@@ -485,7 +510,7 @@ def test_no_trace_keeps_enclosing_trace_ids_for_logs() -> None:
     ):
         assert hot.trace_id == outer.trace_id
         pyrock.info("inside hot path")
-    record = t.logs.find(msg="inside hot path")
+    record = t.logs.find({"msg": "inside hot path"})
     assert record["trace_id"] == outer.trace_id
     assert record["span_id"] == outer.span_id
     assert t.spans.names() == ["outer"]
@@ -505,7 +530,7 @@ def test_decorated_sync_function_runs_in_an_operation_per_call() -> None:
         assert get_user("1") == "user:1"
         assert get_user("2") == "user:2"
     assert t.metrics.value("db_get_user_count", table="users") == 2
-    assert sorted(span.attrs["user_id"] for span in spans_named(t, "db.get_user")) == ["1", "2"]
+    assert sorted(span.attrs["user_id"] for span in t.spans.find(name="db.get_user")) == ["1", "2"]
 
 
 def test_decorated_function_exception_marks_failure_and_propagates() -> None:
@@ -601,8 +626,7 @@ def test_decorator_preserves_function_metadata(original: object) -> None:
     assert wrapped.__doc__ == original.__doc__
     assert wrapped.__module__ == original.__module__  # type: ignore[attr-defined]
     assert inspect.signature(wrapped) == inspect.signature(original)  # type: ignore[arg-type]
-    if wrapped is not original:
-        assert getattr(wrapped, "__wrapped__", None) is original
+    assert wrapped.__wrapped__ is original  # type: ignore[attr-defined]
 
 
 # -- register / event ---------------------------------------------------------

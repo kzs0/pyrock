@@ -1,4 +1,4 @@
-"""Noop behaviour when no ``Bedrock`` is active (DESIGN.md §4.8; Go: ``noop.go``).
+"""Noop behaviour when no ``Bedrock`` is active (DESIGN.md §4.8 as amended by PLAN.md E1-1).
 
 Every test runs in a brand-new, empty context so nothing another test
 activated can leak in.
@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import inspect
 import tracemalloc
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import pyrock
+from pyrock.testing import capture
 from tests.e2e._core_helpers import isolated, run
 
 
@@ -50,10 +53,9 @@ def test_current_is_the_noop_singleton() -> None:
 
 
 @isolated
-def test_scopes_and_live_objects_are_singletons() -> None:
-    assert pyrock.operation("a") is pyrock.operation("b", attrs={"k": "v"})
-    assert pyrock.step("a") is pyrock.step("b")
-    assert pyrock.source("a") is pyrock.source("b")
+def test_live_noop_objects_are_singletons() -> None:
+    # Scopes resolve the instance when entered (PLAN.md decision E1-1), so only
+    # the live objects they yield are guaranteed to be preallocated singletons.
     with pyrock.operation("a") as first:
         pass
     with pyrock.operation("b") as second:
@@ -79,12 +81,86 @@ def test_metric_helpers_return_singletons() -> None:
     assert histogram.labels(x="1") is histogram
 
 
+class _Boom(Exception):
+    pass
+
+
+def _raises() -> None:
+    """Raises _Boom."""
+    raise _Boom("from the function")
+
+
+SCOPES = [
+    pytest.param(lambda: pyrock.operation("op"), id="operation"),
+    pytest.param(lambda: pyrock.step("step"), id="step"),
+    pytest.param(lambda: pyrock.source("src"), id="source"),
+]
+
+
+@pytest.mark.parametrize("make_scope", SCOPES)
 @pytest.mark.parametrize("fn", FUNCTIONS, ids=FUNCTION_IDS)
 @isolated
-def test_decorators_return_the_function_unchanged(fn: object) -> None:
-    assert pyrock.operation("op")(fn) is fn  # type: ignore[type-var]
-    assert pyrock.step("step")(fn) is fn  # type: ignore[type-var]
-    assert pyrock.source("src")(fn) is fn  # type: ignore[type-var]
+def test_decorators_wrap_with_function_metadata(make_scope: Any, fn: Any) -> None:
+    wrapped = make_scope()(fn)
+    assert wrapped.__name__ == fn.__name__
+    assert wrapped.__qualname__ == fn.__qualname__
+    assert wrapped.__doc__ == fn.__doc__
+    assert wrapped.__module__ == fn.__module__
+    assert wrapped.__wrapped__ is fn
+    assert inspect.signature(wrapped) == inspect.signature(fn)
+    assert inspect.iscoroutinefunction(wrapped) == inspect.iscoroutinefunction(fn)
+    assert inspect.isgeneratorfunction(wrapped) == inspect.isgeneratorfunction(fn)
+    assert inspect.isasyncgenfunction(wrapped) == inspect.isasyncgenfunction(fn)
+
+
+@pytest.mark.parametrize("make_scope", SCOPES)
+@isolated
+def test_decorated_function_without_init_returns_and_raises_like_the_original(
+    make_scope: Any,
+) -> None:
+    assert make_scope()(_sync)(1) == 2
+    with pytest.raises(_Boom, match="from the function"):
+        make_scope()(_raises)()
+
+
+@pytest.mark.parametrize("fn", FUNCTIONS, ids=FUNCTION_IDS)
+@isolated
+def test_explicit_noop_instance_returns_the_function_unchanged(fn: Any) -> None:
+    noop = pyrock.current()
+    assert noop.is_noop
+    assert pyrock.operation("op", bedrock=noop)(fn) is fn
+    assert pyrock.step("step", bedrock=noop)(fn) is fn
+    assert pyrock.source("src", bedrock=noop)(fn) is fn
+
+
+@isolated
+def test_function_decorated_before_init_is_instrumented_once_active() -> None:
+    @pyrock.operation("early.sync")
+    def early(x: int) -> int:
+        return x * 2
+
+    @pyrock.operation("early.async")
+    async def early_async() -> str:
+        await asyncio.sleep(0)
+        return "ok"
+
+    @pyrock.step("early.step")
+    def early_step() -> None:
+        pass
+
+    # Before init: the wrappers just run the functions.
+    assert early(1) == 2
+    assert run(early_async()) == "ok"
+    with capture() as t:
+        assert early(2) == 4
+        assert run(early_async()) == "ok"
+        with pyrock.operation("parent"):
+            early_step()
+    assert t.metrics.value("early_sync_count") == 1
+    assert t.metrics.value("early_async_count") == 1
+    assert t.spans.one(name="early.step").parent_span_id == t.spans.one(name="parent").span_id
+    # After the capture ends the instance is gone again.
+    assert early(3) == 6
 
 
 @isolated

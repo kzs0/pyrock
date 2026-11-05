@@ -67,26 +67,26 @@ def logger_name() -> str:
 
 def test_error_message_dropped_by_default(otlp_collector: OTLPHTTPCollector) -> None:
     with (
-        pytest.raises(RuntimeError),
+        pytest.raises(ValueError, match="boom|secret"),
         running(trace_url=otlp_collector.traces_url) as b,
         b.operation("failing"),
     ):
-        raise RuntimeError(SECRET)
+        raise ValueError(SECRET)
     span = otlp_collector.span("failing")
-    assert span["attributes"]["error.type"] == "builtins.RuntimeError"
+    assert span["attributes"]["error.type"] == "builtins.ValueError"
     assert SECRET not in _wire_text(otlp_collector)
 
 
 def test_error_message_kept_with_allow_error_details(otlp_collector: OTLPHTTPCollector) -> None:
     with (
-        pytest.raises(RuntimeError),
+        pytest.raises(ValueError, match="boom|secret"),
         running(
             trace_url=otlp_collector.traces_url,
             data_policy=_policy(allow_error_details=True),
         ) as b,
         b.operation("failing"),
     ):
-        raise RuntimeError("detailed boom")
+        raise ValueError("detailed boom")
     assert otlp_collector.span("failing")["attributes"]["error.message"] == "detailed boom"
 
 

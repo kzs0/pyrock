@@ -215,10 +215,9 @@ def test_bool_sequence_is_array_of_bool_values(otlp_collector: OTLPHTTPCollector
     assert value["arrayValue"]["values"] == [{"boolValue": True}, {"boolValue": False}]
 
 
-def test_static_attrs_are_exported(otlp_collector: OTLPHTTPCollector) -> None:
+def test_static_attrs_are_resource_attributes(otlp_collector: OTLPHTTPCollector) -> None:
     span = export_one(otlp_collector, static_attrs={"env": "production"})
-    exported = {**span["resource"], **span["attributes"]}
-    assert exported["env"] == "production"
+    assert span["resource"]["env"] == "production"
 
 
 # --------------------------------------------------------- protocol selection

@@ -282,10 +282,9 @@ def test_query_fragment_and_path_never_in_span(upstream: Upstream) -> None:
 
 def test_credentials_never_in_span_or_logs(upstream: Upstream) -> None:
     url = f"http://creduser:credpass@127.0.0.1:{upstream.port}/plain"
-    with capture(log_level="DEBUG") as t:
-        # urllib may refuse userinfo in the netloc; the span must still be clean.
-        with contextlib.suppress(OSError):
-            pyrock.http.get(url, timeout=2)
+    # urllib may refuse userinfo in the netloc; the span must still be clean.
+    with capture(log_level="DEBUG") as t, contextlib.suppress(OSError):
+        pyrock.http.get(url, timeout=2)
     for span in t.spans:
         for secret in ("creduser", "credpass"):
             assert not any(secret in v for v in attr_strings(span)), secret

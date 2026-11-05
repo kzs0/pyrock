@@ -19,8 +19,8 @@ from pyrock import privacy
 from tests.e2e._core_helpers import isolated, quiet
 from tests.support.logs import LogCapture
 
-WARNING_LEVELS = {"WARN", "WARNING"}
-"""Go writes ``WARN``; Python's level name is ``WARNING``. Either is accepted."""
+WARN = "WARN"
+"""JSON level names follow Go (PLAN.md decision E1-5): ``WARNING`` is written as ``WARN``."""
 
 
 def _init(log_capture: LogCapture, **overrides: Any) -> pyrock.Bedrock:
@@ -106,7 +106,7 @@ def test_stdlib_loggers_are_structured_and_correlated_with_root_install(
         log.warning("slow upstream")
     record = log_capture.find(msg="slow upstream")
     assert record["logger"] == "myapp.users"
-    assert record["level"] in WARNING_LEVELS
+    assert record["level"] == WARN
     assert record["service"] == "log-svc"
     assert record["trace_id"] == op.trace_id
     assert record["span_id"] == op.span_id
@@ -172,23 +172,23 @@ def test_log_exception_includes_message_when_policy_allows(
 
 
 @pytest.mark.parametrize(
-    ("helper", "levels"),
+    ("helper", "level"),
     [
-        ("debug", {"DEBUG"}),
-        ("info", {"INFO"}),
-        ("warning", WARNING_LEVELS),
-        ("warn", WARNING_LEVELS),
-        ("error", {"ERROR"}),
+        ("debug", "DEBUG"),
+        ("info", "INFO"),
+        ("warning", WARN),
+        ("warn", WARN),
+        ("error", "ERROR"),
     ],
 )
 @isolated
 def test_level_helpers(
-    clean_env: pytest.MonkeyPatch, log_capture: LogCapture, helper: str, levels: set[str]
+    clean_env: pytest.MonkeyPatch, log_capture: LogCapture, helper: str, level: str
 ) -> None:
     with _init(log_capture, log_level="debug"):
         getattr(pyrock, helper)(f"via {helper}", key="value")
     record = log_capture.find(msg=f"via {helper}")
-    assert record["level"] in levels
+    assert record["level"] == level
     assert record["key"] == "value"
     assert record["logger"] == "pyrock"
 
@@ -371,7 +371,7 @@ def test_canonical_log_on_success(clean_env: pytest.MonkeyPatch, log_capture: Lo
 
 
 @isolated
-def test_canonical_log_on_failure_carries_error_type(
+def test_canonical_log_on_failure_carries_error_fields(
     clean_env: pytest.MonkeyPatch, log_capture: LogCapture
 ) -> None:
     with (
@@ -382,7 +382,10 @@ def test_canonical_log_on_failure_carries_error_type(
         raise TimeoutError
     record = log_capture.find(msg="operation.complete", operation="job")
     assert record["success"] is False
+    assert "error" in record
     assert record["error.type"] == "builtins.TimeoutError"
+    assert re.fullmatch(r"[0-9a-f]{16}", record["error.fingerprint"])
+    assert "error.message" not in record
 
 
 @isolated

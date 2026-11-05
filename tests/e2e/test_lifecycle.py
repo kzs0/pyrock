@@ -14,7 +14,7 @@ import urllib.request
 import pytest
 
 import pyrock
-from tests.e2e._core_helpers import isolated, prom_of, quiet, run, span_attr_or_resource
+from tests.e2e._core_helpers import isolated, prom_of, quiet, run
 from tests.support.collectors import OTLPHTTPCollector
 from tests.support.logs import LogCapture
 
@@ -197,8 +197,11 @@ def test_static_attrs_reach_spans_metrics_and_logs(
     assert record["version"] == "1.2.3"
     span = otlp_collector.wait_for_spans(1)[0]
     assert span["resource"]["service.name"] == "static-svc"
-    assert span_attr_or_resource(span, "env") == "production"
-    assert span_attr_or_resource(span, "version") == "1.2.3"
+    # Static attrs are resource attributes on spans (as in Go), not span attributes.
+    assert span["resource"]["env"] == "production"
+    assert span["resource"]["version"] == "1.2.3"
+    assert "env" not in span["attributes"]
+    assert "version" not in span["attributes"]
 
 
 @isolated
