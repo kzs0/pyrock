@@ -1,0 +1,163 @@
+# pyrock delivery plan
+
+Branch: `feat/pyrock-implementation`, created from `main`. The design it
+implements is `DESIGN.md`.
+
+The work goes in strict phases, and each phase starts only when the one before
+it is green and committed. Within a phase, subagents run in parallel, but only
+on **disjoint file sets**, so no two agents ever edit the same file. Agents do
+not commit. The orchestrator reviews, runs the gates and commits once per phase
+or wave.
+
+## Decisions on DESIGN.md §21 open questions
+
+1. **Name:** the distribution and import name are both `pyrock`.
+2. **Thread context:** we do not monkey-patch. Context crosses threads only
+   through the explicit helpers (`bind`, `ContextThreadPoolExecutor`, `Thread`).
+3. **Pre-fork servers:** the fork hook resets state and restarts background
+   threads. Recommended practice is to call `init()` after the fork; this is
+   documented. There is no `{worker}` substitution in v0.
+4. **gRPC:** keep the minimal in-house HTTP/2 client in `trace/otlp/_h2.py`,
+   for parity with Go.
+5. **Expected exceptions:** set per scope only (`expected=`).
+
+## Supported Pythons
+
+| Python | Status |
+|---|---|
+| 3.11, 3.12, 3.13, 3.14 | Required |
+| 3.14t (free-threaded) | Required. Run with `PYTHON_GIL=0`. |
+| 3.15 (pre-release) | Required in CI with `allow-prereleases` |
+
+The rest of the matrix:
+
+- **Linux:** runs the full matrix.
+- **macOS and Windows:** run 3.14 only. Fork tests and Linux-only detectors are
+  skipped there.
+
+Language rules: code must stay valid on 3.11. Newer stdlib APIs (for example
+`sys._is_gil_enabled`) are allowed only behind feature detection.
+
+## Tooling
+
+- `uv` with a PEP 735 `[dependency-groups]` table. The `hatchling` build
+  backend. **No** `[project.dependencies]`.
+- **dev group:** `pytest`, `coverage`, `ruff`, `mypy`.
+- **compat group** (test-only): `protobuf` and `opentelemetry-proto`, used to
+  decode our OTLP bytes with the official schema; `grpcio`, used as a real gRPC
+  collector. These tests skip cleanly when the packages can't be installed, for
+  example on 3.15 beta or 3.14t.
+- `make ci` mirrors CI: `ruff format --check`, `ruff check`, `mypy --strict src`,
+  `pytest` with ≥80% branch coverage, plus the boundary tests.
+
+## Phases
+
+### Phase 0: Scaffold and API contract (1 agent, sequential)
+
+The deliverable is a package that imports cleanly on every supported Python and
+fixes the **public contract**:
+
+- **Project files:** `pyproject.toml`, `src/pyrock/**` (every module from
+  DESIGN §3), `py.typed`, `Makefile`, and `.github/workflows/ci.yml`.
+- **Public API:** every public class, function and signature from the design,
+  fully typed and documented. Bodies `raise NotImplementedError`. The exception
+  is pure data types, which are written for real: `Config` fields and
+  validation stubs, `privacy.Policy`, `ProfileExportConfig`, `ProfileType`,
+  `SpanKind`, `SpanContext`, and the error classes.
+- **Shared test support in `tests/support/`:** this is the only shared test
+  code, and later phases may not edit it:
+  - an OTLP/HTTP fake collector (JSON);
+  - a profiles collector;
+  - a metrics-push sink;
+  - a fake AWS IMDS and GCP metadata server;
+  - a gRPC collector built on grpcio, which skips when grpcio is unavailable;
+  - log capture helpers;
+  - a minimal WSGI and ASGI driver, so tests need no frameworks.
+- **Structural tests in `tests/structure/`:**
+  - stdlib-only imports;
+  - internal dependency boundaries (DESIGN §3);
+  - `import pyrock` is lazy (heavy modules are not loaded);
+  - the public names in `pyrock.__all__` match the contract.
+
+Gate: the package imports on 3.11–3.15 and 3.14t, structural tests pass, and
+`ruff` and `mypy --strict` are clean.
+
+### Phase 1: End-to-end functional tests (3 parallel agents, `tests/e2e/`)
+
+These are black-box tests. They use only the public API and observe only
+external output: the bytes a collector receives, `/metrics` text, log lines,
+HTTP headers, and process behaviour. They are expected to **fail** (red) until
+Phase 3.
+
+| Agent | Files | Covers |
+|---|---|---|
+| E1 core | `test_lifecycle.py`, `test_operations.py`, `test_steps_sources.py`, `test_context.py`, `test_logging.py`, `test_noop.py` | init/shutdown, operations (exception → failure, expected, fail/succeed, numbering, no_trace, decorators on sync/async/generators), steps, sources, contextvars across asyncio/threads/helpers, logging + canonical log, noop |
+| E2 HTTP | `test_wsgi.py`, `test_asgi.py`, `test_client.py`, `test_propagation.py`, `test_server.py` | middleware attrs/labels/status/route/streaming/exceptions, client spans + header injection, two-service trace continuity, observability server endpoints and hardening (slow headers, header limit, connection cap) |
+| E3 export | `test_trace_export.py`, `test_metrics.py`, `test_cloud.py`, `test_profiles.py`, `test_privacy.py`, `test_envdetect.py`, `test_fork.py`, `test_config_env.py` | OTLP HTTP and gRPC export, sampling, exposition, runtime metrics, limits, cloud wiring (gRPC + push + profiles, retry, fan-out), profile export, privacy policy, environment detection, fork safety, env-var config and `env.parse` |
+
+Gate: the tests collect on every Python, fail only with `NotImplementedError`
+or assertion failures (never import or syntax errors), and the orchestrator has
+reviewed them for coverage of DESIGN.md.
+
+### Phase 2: Unit and component tests (4 parallel agents, `tests/unit/<area>/`)
+
+These are contract tests for each module. They test observable behaviour, not
+private internals.
+
+| Agent | Area |
+|---|---|
+| U1 | `attr`, `env`, `config`, `privacy` |
+| U2 | `trace` (w3c, sampler, span/tracer, propagator), `trace/otlp` (`_pb`, `_h2`, http, grpc, batch) |
+| U3 | `metric` (registry, types, limits), `prometheus`, `runtime`, `log` |
+| U4 | `profile` (sampler, heap, stacks, locks, pprof and OTLP encoders, export, debug), `server` |
+
+The core modules (`operation`, `_bedrock`, `wsgi`, `asgi`, `http`, `cloud`) are
+covered mainly by E2E tests. U-agents add component tests for them only when
+the logic can be isolated.
+
+Gate: same as Phase 1.
+
+### Phase 3: Implementation (waves follow the dependency order)
+
+Each agent owns its `src/` files. To be done, an agent must:
+
+- make its unit tests green;
+- keep `ruff` and `mypy --strict` clean;
+- not break any other test.
+
+**Tests are the contract:** an agent may not edit tests. If it believes a test
+is wrong, it reports this, and the orchestrator decides.
+
+| Wave | Agents (parallel within a wave) |
+|---|---|
+| 3a leaves | I1 `attr`, `env`, `config`, `privacy` · I2 `trace` core + `trace/otlp` (`_pb`, http, batch) · I3 `metric` + `prometheus` + `runtime` · I4 `trace/otlp/_h2` + grpc exporter |
+| 3b services | I5 `log` · I6 `server` · I7 `profile/*` |
+| 3c core | I8 `_context`, `_noop`, `_bedrock`, `operation`, `__init__`, `testing`, `_envdetect`, fork hook |
+| 3d integrations | I9 `wsgi`, `asgi`, `http` · I10 `cloud`, `_push`, profile push wiring |
+
+The orchestrator commits after each wave and pushes.
+
+### Phase 4: Validation
+
+1. Full gates on 3.11, 3.12, 3.13, 3.14, 3.14t (`PYTHON_GIL=0`) and 3.15b,
+   run locally through `uv run --python`.
+2. Concurrency-sensitive tests repeated (`--count`-style loops) on 3.14t.
+3. Compat suite: decode with the official OTLP protos and run a real grpcio
+   collector.
+4. Review agent: coherence, idiom, API consistency against DESIGN.md, and dead
+   code. The orchestrator triages its findings and agents apply the fixes.
+5. Docs: `README.md`, `CHANGELOG.md` (Unreleased), `CONTRIBUTING.md`,
+   `SECURITY.md`, and `examples/`.
+6. Push and confirm CI is green.
+
+## Rules for every agent
+
+- Only standard library code in `src/`, which must stay valid on Python 3.11.
+  Use `from __future__ import annotations`, PEP 604 unions, `typing.Self`, and
+  `dataclass(slots=True)`. Do not use 3.12+ syntax such as `type X = ...` or
+  PEP 695 generics.
+- Every module must be safe without the GIL: shared mutable state is guarded by
+  `threading.Lock`.
+- Wait with events, barriers and test servers, not `time.sleep`. Every network
+  test binds to `127.0.0.1:0`.
+- Do not touch files outside the agent's assignment. Report blockers instead.
