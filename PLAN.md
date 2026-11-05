@@ -328,3 +328,15 @@ These were decided during the phases and are binding for every later phase.
       with unit tests.
     - **Compat profile tests:** these only check fields shared between
       v0.2.0 and the newer schema, so `opentelemetry-proto` is not pinned.
+
+## Phase 3 wave adjustment
+
+Nearly every module depends on `attr` and `privacy`, so wave 3a is split in
+two:
+
+- **3a-0:** I1 (`attr`, `env`, `config`, `privacy`) runs alongside I4
+  (`trace/otlp/_h2.py`), which depends on nothing.
+- **3a-1:** I2 (trace core plus `_pb`, http, batch **and the grpc exporter**)
+  runs alongside I3 (`metric`, `prometheus`, `runtime`).
+
+Waves 3b–3d are unchanged.
