@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.11.32"
+  FORCE_COLOR: "1"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  lint:
+    name: lint (ruff, mypy --strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.14"
+          enable-cache: true
+      - run: uv sync --group dev
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy --strict src
+
+  test:
+    name: test (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14", "3.14t", "3.15"]
+        include:
+          - python: "3.14"
+            coverage: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Disable the GIL on free-threaded builds
+        if: endsWith(matrix.python, 't')
+        run: echo "PYTHON_GIL=0" >> "$GITHUB_ENV"
+      - run: uv python install ${{ matrix.python }}
+      - run: uv sync --group dev
+      - name: Interpreter info
+        run: uv run python -c "import sys, sysconfig; print(sys.version); print('free-threaded:', bool(sysconfig.get_config_var('Py_GIL_DISABLED')))"
+      - name: Tests
+        if: ${{ !matrix.coverage }}
+        run: uv run pytest
+      - name: Tests with coverage (>= 80% branch)
+        if: ${{ matrix.coverage }}
+        run: |
+          uv run coverage run -m pytest
+          uv run coverage report
+
+  test-os:
+    name: test (${{ matrix.os }}, 3.14)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.14"
+          enable-cache: true
+      - run: uv sync --group dev
+      - run: uv run pytest
+
+  compat:
+    name: compat (official OTLP protos, real grpcio)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --group dev --group compat
+      - run: uv run pytest -m compat -rs
+
+  build:
+    name: build (pure wheel, no dependencies)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.14"
+      - run: uv build
+      - name: Check wheel metadata
+        shell: python
+        run: |
+          import email.parser, glob, sys, zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, wheels
+          wheel = wheels[0]
+          assert wheel.endswith("-py3-none-any.whl"), f"not a pure-python wheel: {wheel}"
+          with zipfile.ZipFile(wheel) as zf:
+              names = zf.namelist()
+              meta_name = next(n for n in names if n.endswith(".dist-info/METADATA"))
+              wheel_name = next(n for n in names if n.endswith(".dist-info/WHEEL"))
+              meta = email.parser.Parser().parsestr(zf.read(meta_name).decode())
+              wheel_meta = email.parser.Parser().parsestr(zf.read(wheel_name).decode())
+          requires = meta.get_all("Requires-Dist") or []
+          assert not requires, f"wheel declares runtime dependencies: {requires}"
+          assert wheel_meta["Root-Is-Purelib"] == "true", wheel_meta["Root-Is-Purelib"]
+          assert wheel_meta.get_all("Tag") == ["py3-none-any"], wheel_meta.get_all("Tag")
+          assert "pyrock/py.typed" in names, "py.typed missing from wheel"
+          compiled = [n for n in names if n.endswith((".so", ".pyd", ".dylib"))]
+          assert not compiled, compiled
+          print(f"{wheel}: OK ({len(names)} files, no Requires-Dist)")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
