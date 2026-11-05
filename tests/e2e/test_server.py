@@ -9,6 +9,7 @@ uses short timeouts; waits use events, not sleeps.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import socket
 import threading
 import time
@@ -279,9 +280,42 @@ def test_connection_cap_rejects_beyond_limit() -> None:
             finally:
                 blocker.release.set()
             assert [f.result(timeout=5).status for f in held] == [200, 200]
-        assert status_of(rejected) in (None, 503)
+        assert status_of(rejected) == 503
         # Capacity frees up once the in-flight requests finish.
         wait_until(lambda: http_get(addr, "/health").status == 200)
+
+
+def test_init_server_max_connections_maps_to_the_server() -> None:
+    assert "server_max_connections" in {f.name for f in dataclasses.fields(pyrock.Config)}
+    assert pyrock.Config().server_max_connections == 64
+    blocker = BlockingProfiler()
+    with (
+        running(
+            server_max_connections=1, server_pprof=True, server_profile_handler=blocker
+        ) as bedrock,
+        ThreadPoolExecutor(max_workers=1) as pool,
+    ):
+        addr = _address(bedrock)
+        try:
+            held = pool.submit(http_get, addr, "/debug/pprof/profile")
+            assert blocker.entered.acquire(timeout=5)
+            assert http_get(addr, "/health").status == 503
+        finally:
+            blocker.release.set()
+        assert held.result(timeout=5).status == 200
+
+
+def test_profile_handler_sees_unchanged_path_info() -> None:
+    paths: list[str] = []
+
+    def handler(environ: dict[str, Any], start_response: Any) -> list[bytes]:
+        paths.append(environ["PATH_INFO"])
+        start_response("200 OK", [])
+        return [b""]
+
+    with running(server_pprof=True, server_profile_handler=handler) as bedrock:
+        http_get(_address(bedrock), "/debug/pprof/goroutine?debug=1")
+    assert paths == ["/debug/pprof/goroutine"]
 
 
 def test_graceful_shutdown_waits_for_in_flight_requests() -> None:

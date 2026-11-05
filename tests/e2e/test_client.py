@@ -18,6 +18,7 @@ import pytest
 
 import pyrock
 import pyrock.http
+from pyrock import privacy
 from pyrock.testing import capture
 from pyrock.trace import SpanContext, SpanKind, TraceState
 from tests.e2e._http_helpers import attr_strings, free_port
@@ -294,14 +295,24 @@ def test_credentials_never_in_span_or_logs(upstream: Upstream) -> None:
     assert "credpass" not in dumped
 
 
-def test_http_url_attr_is_sanitized(upstream: Upstream) -> None:
+def test_http_url_and_target_absent_by_default(upstream: Upstream) -> None:
     with capture() as t:
         pyrock.http.get(upstream.url + "/p?q=1#f")
     attrs = t.spans.one(name="HTTP GET").attrs
-    if "http.url" in attrs:
-        assert attrs["http.url"].startswith(f"http://127.0.0.1:{upstream.port}")
-        assert "?" not in attrs["http.url"]
-        assert "#" not in attrs["http.url"]
+    assert "http.url" not in attrs
+    assert "http.target" not in attrs
+
+
+def test_allowlisted_http_url_is_sanitized(upstream: Upstream) -> None:
+    policy = privacy.Policy(attribute_keys=["http.*"])
+    with capture(data_policy=policy) as t:
+        pyrock.http.get(upstream.url + "/p?q=qsecret#fsecret")
+    url = t.spans.one(name="HTTP GET").attrs["http.url"]
+    assert url.startswith(f"http://127.0.0.1:{upstream.port}")
+    assert "qsecret" not in url
+    assert "fsecret" not in url
+    assert "?" not in url
+    assert "#" not in url
 
 
 # ---------------------------------------------------------------- openers and handlers

@@ -28,7 +28,9 @@ from tests.e2e._http_helpers import (
     PARENT_SPAN_ID,
     TRACE_ID,
     TRACEPARENT,
+    require_param,
     serve_handler,
+    serve_threaded,
     serve_wsgi,
 )
 from tests.support.asgi_driver import run_asgi
@@ -208,6 +210,30 @@ def test_instrument_http_server_handler_sees_current_operation() -> None:
     (op,) = _Hello.seen
     assert op is not None
     assert op.span_id == t.spans.one(name="http.request").span_id
+
+
+def test_instrument_http_server_on_threading_server_without_context_copy() -> None:
+    _Hello.seen = []
+    with capture() as t:
+        handler = pyrock.http.instrument_http_server(_Hello)  # captures the active instance
+        with serve_threaded(handler_class=handler) as base:
+            assert _raw_get(base, "/", {"traceparent": TRACEPARENT}) == 200
+    span = t.spans.one(name="http.request")
+    assert span.trace_id == TRACE_ID
+    (op,) = _Hello.seen
+    assert op is not None
+    assert op.span_id == span.span_id
+
+
+def test_instrument_http_server_explicit_bedrock_wins() -> None:
+    require_param(pyrock.http.instrument_http_server, "bedrock")
+    with capture() as outer:
+        with capture() as inner:
+            handler = pyrock.http.instrument_http_server(_Hello, bedrock=outer.bedrock)
+            with serve_threaded(handler_class=handler) as base:
+                _raw_get(base, "/")
+        assert len(inner.spans) == 0
+    assert len(outer.spans.find(name="http.request")) == 1
 
 
 # ---------------------------------------------------------------- custom propagator

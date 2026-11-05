@@ -10,6 +10,7 @@ passthrough (and opt-in websocket instrumentation).
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -27,6 +28,7 @@ from tests.e2e._http_helpers import (
     ASGIFlavor,
     MiddlewareContract,
     default_headers,
+    require_param,
 )
 from tests.support.asgi_driver import call_asgi, call_lifespan, call_websocket, run_asgi
 
@@ -140,7 +142,9 @@ def test_exception_after_response_start_is_failure_and_reraised() -> None:
     with capture() as t, pytest.raises(ConnectionAbortedError) as info:
         run_asgi(Middleware(app), "GET", "/", headers=default_headers())
     assert info.value.asgi_response.chunks == [b"part"]  # type: ignore[attr-defined]
-    assert t.spans.one(name="http.request").failed
+    span = t.spans.one(name="http.request")
+    assert span.failed
+    assert span.attrs["http.status_code"] == 200  # the status already sent
 
 
 def test_https_scheme_from_scope() -> None:
@@ -251,3 +255,65 @@ def test_websocket_instrumentation_covers_the_whole_connection() -> None:
     assert ops[0].ended
     (span,) = list(t.spans)
     assert span.kind is SpanKind.SERVER
+    assert span.name == "http.websocket"
+
+
+@pytest.mark.parametrize("scheme", ["ws", "wss"])
+def test_websocket_span_attributes(scheme: str) -> None:
+    with capture() as t:
+        asyncio.run(call_websocket(Middleware(_echo_ws, websocket=True), "/ws/room", scheme=scheme))
+    span = t.spans.one(name="http.websocket")
+    assert span.attrs["http.scheme"] == scheme
+    assert span.attrs["http.route"] == "_"
+
+
+def test_websocket_operation_name_is_overridable() -> None:
+    with capture() as t:
+        asyncio.run(
+            call_websocket(Middleware(_echo_ws, websocket=True, operation_name="chat.session"))
+        )
+    assert t.spans.names() == ["chat.session"]
+
+
+def _run_in_plain_thread(app: Any) -> Any:
+    """Serve one request on a new thread and event loop, with no copied context."""
+    result: list[Any] = []
+    thread = threading.Thread(
+        target=lambda: result.append(run_asgi(app, "GET", "/", headers=default_headers()))
+    )
+    thread.start()
+    thread.join(10)
+    assert result, "request did not complete"
+    return result[0]
+
+
+def test_requests_on_another_thread_use_the_instance_captured_at_construction() -> None:
+    seen: list[Any] = []
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _drain(receive)
+        seen.append(pyrock.current_operation())
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    with capture() as t:
+        middleware = Middleware(app)
+        assert _run_in_plain_thread(middleware).status == 200
+    span = t.spans.one(name="http.request")
+    assert seen[0] is not None
+    assert seen[0].span_id == span.span_id
+
+
+def test_explicit_bedrock_is_used_on_another_thread() -> None:
+    require_param(Middleware, "bedrock")
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _drain(receive)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    with capture() as outer:
+        with capture() as inner:
+            _run_in_plain_thread(Middleware(app, bedrock=outer.bedrock))
+        assert len(inner.spans) == 0
+    assert len(outer.spans.find(name="http.request")) == 1

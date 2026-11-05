@@ -24,6 +24,10 @@ class NotFoundError(Exception):
     """A user-defined error type, to check qualified ``error.type`` names."""
 
 
+class WrapperError(Exception):
+    """Wraps another error (not a RuntimeError, so NotImplementedError can't satisfy it)."""
+
+
 def _qualified(tp: type[BaseException]) -> str:
     return f"{tp.__module__}.{tp.__qualname__}"
 
@@ -41,8 +45,8 @@ def _raise_wrapped(*, explicit: bool) -> None:
         raise KeyError("inner")
     except KeyError as inner:
         if explicit:
-            raise RuntimeError("outer") from inner
-        raise RuntimeError("outer")  # noqa: B904 - implicit __context__ on purpose
+            raise WrapperError("outer") from inner
+        raise WrapperError("outer")  # noqa: B904 - implicit __context__ on purpose
 
 
 def _event_names(span: object) -> list[str]:
@@ -198,10 +202,10 @@ def test_error_fingerprint_is_stable_across_calls_and_distinguishes_sites() -> N
 
 @pytest.mark.parametrize("explicit", [True, False], ids=["cause", "context"])
 def test_error_chain_lists_wrapped_exception_types(explicit: bool) -> None:
-    with capture() as t, pytest.raises(RuntimeError), pyrock.operation("wrapped"):
+    with capture() as t, pytest.raises(WrapperError), pyrock.operation("wrapped"):
         _raise_wrapped(explicit=explicit)
     attrs = t.spans.one(name="wrapped").attrs
-    assert attrs["error.type"] == "builtins.RuntimeError"
+    assert attrs["error.type"] == _qualified(WrapperError)
     chain = attrs["error.chain"]
     assert isinstance(chain, list)
     assert all(isinstance(item, str) for item in chain)
