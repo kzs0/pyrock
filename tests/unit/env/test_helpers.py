@@ -28,8 +28,8 @@ from pyrock.env import Env, ParseError, parse_bool, parse_duration
         (".5s", 0.5),
         ("1.s", 1.0),
         ("250us", 0.00025),
-        ("250µs", 0.00025),  # noqa: RUF001 - U+00B5 micro sign, as Go accepts
-        ("250μs", 0.00025),  # noqa: RUF001 - U+03BC greek mu, as Go accepts
+        ("250µs", 0.00025),
+        ("250μs", 0.00025),
         ("100ns", 1e-7),
         ("1m0.5s", 60.5),
         ("1.5h", 5400.0),

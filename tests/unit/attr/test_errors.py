@@ -35,7 +35,7 @@ class WrapperError(Exception):
 def _catch(fn: Callable[[], object]) -> BaseException:
     try:
         fn()
-    except BaseException as exc:  # noqa: BLE001 - the test inspects whatever was raised
+    except BaseException as exc:
         return exc
     raise AssertionError("expected an exception")
 

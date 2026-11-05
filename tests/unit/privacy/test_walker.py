@@ -311,7 +311,7 @@ def test_shared_policy_under_concurrent_use() -> None:
                 j = (index + round_) % len(inputs)
                 if policy.apply(inputs[j]) != expected[j]:
                     failures.append(f"thread {index} round {round_}: input {j} differed")
-        except Exception as exc:  # noqa: BLE001 - reported through failures
+        except Exception as exc:
             failures.append(f"thread {index}: {type(exc).__name__}")
 
     threads = [threading.Thread(target=work, args=(i,)) for i in range(n_threads)]
@@ -341,7 +341,7 @@ def test_concurrent_label_and_message_cleaning() -> None:
                 pair = (policy.label_value("k", "abcdefghijkl"), policy.message("m" * 40))
                 with lock:
                     results.append(pair)
-        except Exception as exc:  # noqa: BLE001 - reported through errors
+        except Exception as exc:
             with lock:
                 errors.append(type(exc).__name__)
 

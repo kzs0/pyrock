@@ -19,7 +19,7 @@ from pyrock.attr import _normalize_value, _text_value
 
 INT64_MAX = (1 << 63) - 1
 INT64_MIN = -(1 << 63)
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
 
 

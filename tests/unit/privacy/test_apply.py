@@ -44,7 +44,7 @@ def test_supported_scalar_types_are_kept() -> None:
         "f": 1.5,
         "b": False,
         "td": datetime.timedelta(seconds=2),
-        "dt": datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc),
+        "dt": datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC),
         "raw": b"\x01\x02",
         "seq": ["a", "b"],
     }
