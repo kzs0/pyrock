@@ -161,3 +161,41 @@ The orchestrator commits after each wave and pushes.
 - Wait with events, barriers and test servers, not `time.sleep`. Every network
   test binds to `127.0.0.1:0`.
 - Do not touch files outside the agent's assignment. Report blockers instead.
+
+## Contract decisions log
+
+These were decided during the phases and are binding for every later phase.
+
+### From E1 (core e2e)
+
+1. **Decorators always wrap.** `@operation`, `@step` and `@source` return a
+   `functools.wraps` wrapper and look up the active instance **at call time**,
+   so functions decorated at import time, before `init()`, are instrumented.
+   The noop path costs one `ContextVar.get()` plus a direct call. Returning the
+   function unchanged applies only when an explicit noop `bedrock=` is given.
+   (This supersedes DESIGN §4.8, which said noop decorators return the function
+   unchanged.)
+2. **Exiting `with pyrock.init()`** shuts down and restores the previous
+   context value, which deactivates the instance.
+3. **`Bedrock(...)` is fully live but not activated.** The constructor starts
+   exporters, the server and log install according to config. It is not
+   activated and must be shut down.
+4. **Duplicate-name numbering** applies only among children of the same parent
+   operation or step. Root operations and direct children of a source are
+   never numbered, so span names stay bounded in loops.
+5. **Log level names** in JSON follow Go: `DEBUG`, `INFO`, `WARN`, `ERROR`.
+   Python's `CRITICAL` stays `CRITICAL`.
+6. **A failed canonical log** includes `error`, `error.type` and
+   `error.fingerprint`. `error.message` is added only with
+   `allow_error_details`.
+7. **Error attribute types:**
+   - `error.chain` and `error.types` are `list[str]`.
+   - `error.fingerprint` is 16 lowercase hex characters.
+   - `error.group.count` is `int`.
+8. **Static attrs** are *resource* attributes on exported spans (as in Go),
+   top-level fields in logs, and labels on metrics.
+9. **`pyrock.testing` filters** (`CapturedMetrics.value` and
+   `CapturedLogs.find`) accept an optional positional mapping, for dotted
+   keys, in addition to `**kwargs`.
+10. **`pyrock.Thread`** accepts `context=`, with the same meaning as on 3.14's
+    `threading.Thread`.
