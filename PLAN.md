@@ -259,3 +259,8 @@ These were decided during the phases and are binding for every later phase.
     Profile uploads carry `x-profile-type`.
 31. **Nested `capture()` / `with init()` blocks** restore the outer active
     instance when they exit. This is the same rule as decision 2.
+32. **`pyrock.cloud(...)` takes every `CloudConfig` field** as a keyword,
+    including `retry_backoff` and `traces_endpoint`.
+    - `traces_endpoint` accepts either a bare `host:port` or a URL.
+    - With a URL, the scheme is stripped and the default port added, the same
+      as Go's endpoint normalisation.
