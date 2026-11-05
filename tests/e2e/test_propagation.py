@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import http.client
 import http.server
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -61,9 +61,13 @@ def _frontend(b_url: str) -> Any:
 
 
 def test_two_wsgi_services_share_one_trace() -> None:
-    with capture() as t, serve_wsgi(_backend()) as b_url, serve_wsgi(_frontend(b_url)) as a_url:
-        with pyrock.operation("client"):
-            body = pyrock.http.get(a_url + "/", timeout=5).read()
+    with (
+        capture() as t,
+        serve_wsgi(_backend()) as b_url,
+        serve_wsgi(_frontend(b_url)) as a_url,
+        pyrock.operation("client"),
+    ):
+        body = pyrock.http.get(a_url + "/", timeout=5).read()
     assert body == b"a+from-b"
     trace_ids = {s.trace_id for s in t.spans}
     assert len(trace_ids) == 1
@@ -71,9 +75,13 @@ def test_two_wsgi_services_share_one_trace() -> None:
 
 
 def test_two_wsgi_services_link_parent_and_child() -> None:
-    with capture() as t, serve_wsgi(_backend()) as b_url, serve_wsgi(_frontend(b_url)) as a_url:
-        with pyrock.operation("client"):
-            pyrock.http.get(a_url + "/", timeout=5).read()
+    with (
+        capture() as t,
+        serve_wsgi(_backend()) as b_url,
+        serve_wsgi(_frontend(b_url)) as a_url,
+        pyrock.operation("client"),
+    ):
+        pyrock.http.get(a_url + "/", timeout=5).read()
     client = t.spans.one(name="client")
     service_a = t.spans.one(name="service.a")
     service_b = t.spans.one(name="service.b")
@@ -120,7 +128,7 @@ def test_asgi_service_calling_wsgi_service_shares_trace() -> None:
 
 
 class _Hello(http.server.BaseHTTPRequestHandler):
-    seen: list[Any] = []
+    seen: ClassVar[list[Any]] = []
 
     def log_message(self, format: str, *args: Any) -> None:
         pass

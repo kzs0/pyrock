@@ -6,6 +6,7 @@ bytes and headers; spans come from ``pyrock.testing.capture()``.
 
 from __future__ import annotations
 
+import contextlib
 import http.cookiejar
 import json
 import urllib.error
@@ -174,7 +175,7 @@ def test_raise_for_status_raises_http_error(upstream: Upstream) -> None:
 
 
 def test_connection_refused_raises_and_records_error() -> None:
-    with capture() as t, pytest.raises(OSError):
+    with capture() as t, pytest.raises(urllib.error.URLError):
         pyrock.http.get(f"http://127.0.0.1:{free_port()}/", timeout=2)
     assert t.spans.one(name="HTTP GET").failed
 
@@ -182,7 +183,7 @@ def test_connection_refused_raises_and_records_error() -> None:
 def test_timeout_is_applied(upstream: Upstream) -> None:
     upstream.hang()
     try:
-        with capture() as t, pytest.raises(OSError):
+        with capture() as t, pytest.raises((TimeoutError, urllib.error.URLError)):
             pyrock.http.get(upstream.url + "/slow", timeout=0.2)
     finally:
         upstream.release()
@@ -282,10 +283,9 @@ def test_query_fragment_and_path_never_in_span(upstream: Upstream) -> None:
 def test_credentials_never_in_span_or_logs(upstream: Upstream) -> None:
     url = f"http://creduser:credpass@127.0.0.1:{upstream.port}/plain"
     with capture(log_level="DEBUG") as t:
-        try:
+        # urllib may refuse userinfo in the netloc; the span must still be clean.
+        with contextlib.suppress(OSError):
             pyrock.http.get(url, timeout=2)
-        except OSError:
-            pass  # urllib may refuse userinfo in the netloc; the span must still be clean
     for span in t.spans:
         for secret in ("creduser", "credpass"):
             assert not any(secret in v for v in attr_strings(span)), secret
@@ -340,9 +340,12 @@ def test_request_accepts_a_custom_opener(upstream: Upstream) -> None:
 
 def test_tracing_handler_on_plain_urllib_opener(upstream: Upstream) -> None:
     opener = urllib.request.build_opener(pyrock.http.TracingHandler())
-    with capture() as t, pyrock.operation("caller"):
-        with opener.open(upstream.url + "/plain", timeout=5) as resp:
-            assert resp.read() == b"hello"
+    with (
+        capture() as t,
+        pyrock.operation("caller"),
+        opener.open(upstream.url + "/plain", timeout=5) as resp,
+    ):
+        assert resp.read() == b"hello"
     client = t.spans.one(name="HTTP GET")
     assert client.kind is SpanKind.CLIENT
     assert client.parent_span_id == t.spans.one(name="caller").span_id

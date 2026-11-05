@@ -138,7 +138,7 @@ def test_server_disabled_starts_nothing() -> None:
 def test_shutdown_stops_the_server() -> None:
     with running() as bedrock:
         addr = _address(bedrock)
-    with pytest.raises(OSError):
+    with pytest.raises(ConnectionRefusedError):
         socket.create_connection(addr, timeout=1).close()
 
 
@@ -233,12 +233,14 @@ def test_slow_header_drip_is_disconnected_at_the_deadline() -> None:
 
 
 def test_header_over_limit_gets_431_and_close() -> None:
-    with running(server_max_header_bytes=1024) as bedrock:
-        with socket.create_connection(_address(bedrock), timeout=5) as sock:
-            request = b"GET /health HTTP/1.1\r\nHost: x\r\nX-Big: " + b"a" * 8192 + b"\r\n\r\n"
-            with contextlib.suppress(OSError):
-                sock.sendall(request)
-            data = read_until_closed(sock, timeout=4)
+    request = b"GET /health HTTP/1.1\r\nHost: x\r\nX-Big: " + b"a" * 8192 + b"\r\n\r\n"
+    with (
+        running(server_max_header_bytes=1024) as bedrock,
+        socket.create_connection(_address(bedrock), timeout=5) as sock,
+    ):
+        with contextlib.suppress(OSError):
+            sock.sendall(request)
+        data = read_until_closed(sock, timeout=4)
     assert status_of(data) == 431
 
 
@@ -249,12 +251,14 @@ def test_header_under_limit_is_served() -> None:
 
 
 def test_idle_keep_alive_connection_is_closed() -> None:
-    with manual(idle_timeout=0.5) as srv:
-        with socket.create_connection(_address(srv), timeout=5) as sock:
-            sock.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
-            start = time.monotonic()
-            data = read_until_closed(sock, timeout=4)
-            elapsed = time.monotonic() - start
+    with (
+        manual(idle_timeout=0.5) as srv,
+        socket.create_connection(_address(srv), timeout=5) as sock,
+    ):
+        sock.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+        start = time.monotonic()
+        data = read_until_closed(sock, timeout=4)
+        elapsed = time.monotonic() - start
     assert status_of(data) == 200
     assert elapsed < 3.0
 
@@ -300,7 +304,7 @@ def test_graceful_shutdown_waits_for_in_flight_requests() -> None:
         assert in_flight.result(timeout=5).status == 200
         stopper.result(timeout=5)
     assert done.is_set()
-    with pytest.raises(OSError):
+    with pytest.raises(ConnectionRefusedError):
         socket.create_connection(addr, timeout=1).close()
 
 
