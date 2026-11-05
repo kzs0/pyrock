@@ -43,7 +43,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TextIO
 
@@ -55,6 +55,7 @@ from pyrock._compat import (
     seconds,
 )
 from pyrock._types import WSGIApp
+from pyrock.env import _parse_float, _parse_int, parse_bool, parse_duration
 from pyrock.privacy import Policy
 
 if TYPE_CHECKING:
@@ -104,6 +105,43 @@ _DURATION_FIELDS = (
     "server_idle_timeout",
     "shutdown_timeout",
 )
+
+
+def _parse_buckets(raw: str) -> tuple[float, ...]:
+    buckets: list[float] = []
+    for index, item in enumerate(raw.split(","), start=1):
+        try:
+            buckets.append(_parse_float(item.strip()))
+        except ValueError as exc:
+            raise ValueError(f"item {index}: {exc}") from None
+    return tuple(buckets)
+
+
+_BOOL_FIELDS = (
+    "trace_insecure",
+    "log_add_source",
+    "log_canonical",
+    "runtime_metrics",
+    "server_enabled",
+    "server_metrics",
+    "server_pprof",
+    "disable_environment_detection",
+)
+_INT_FIELDS = (
+    "metric_series_limit",
+    "metric_family_limit",
+    "server_max_header_bytes",
+    "server_max_connections",
+)
+
+_ENV_PARSERS: Mapping[str, Callable[[str], Any]] = {
+    **dict.fromkeys(_BOOL_FIELDS, parse_bool),
+    **dict.fromkeys(_INT_FIELDS, _parse_int),
+    **dict.fromkeys(_DURATION_FIELDS, parse_duration),
+    "trace_sample_rate": _parse_float,
+    "metric_buckets": _parse_buckets,
+}
+"""Field -> parser for non-string variables; the rest are taken verbatim."""
 
 
 class ConfigError(ValueError):
@@ -225,9 +263,31 @@ class Config:
     def from_env(cls, environ: Mapping[str, str] = os.environ) -> Config:
         """Build a config from ``BEDROCK_*`` variables (unset ones keep defaults).
 
-        Raises :class:`ConfigError` listing every malformed variable.
+        Empty variables count as unset. Raises :class:`ConfigError` listing every
+        malformed variable (by name, never echoing its value) together with
+        every validation problem of the result.
         """
-        raise NotImplementedError
+        problems: list[str] = []
+        values: dict[str, Any] = {}
+        for name, var in ENV_VARS.items():
+            raw = environ.get(var, "")
+            if not raw:
+                continue
+            parser = _ENV_PARSERS.get(name)
+            if parser is None:
+                values[name] = raw
+                continue
+            try:
+                values[name] = parser(raw)
+            except ValueError as exc:
+                problems.append(f"{var}: {exc}")
+        try:
+            config = cls(**values)
+        except ConfigError as exc:
+            problems.extend(exc.problems)
+        if problems:
+            raise ConfigError(problems)
+        return config
 
     @classmethod
     def default(cls) -> Config:
