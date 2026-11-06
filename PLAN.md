@@ -441,3 +441,15 @@ Waves 3b–3d are unchanged.
 - **Fork:** call `bp._after_fork_in_child()` from `after_in_child`. Wrapping
   exporters (retry and fan-out in `_cloud`) must forward
   `_after_fork_in_child` to the exporters they wrap.
+
+### `server` (from I6)
+
+- **Construction:** `server.Server(registry, server.Config(addr=,
+  metrics=, pprof=, profile_handler=, read_timeout=,
+  read_header_timeout=, write_timeout=, idle_timeout=,
+  max_header_bytes=, shutdown_timeout=, max_connections=))`.
+- **Lifecycle:**
+  - `.start()` runs on daemon threads and raises `OSError` if the port is
+    busy.
+  - `.address` is `(host, port)` once started.
+  - `.shutdown(timeout=)` is idempotent.
