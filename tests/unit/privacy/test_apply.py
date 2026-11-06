@@ -437,7 +437,9 @@ def test_unknown_nested_objects_are_suppressed_without_rendering() -> None:
 def test_other_unknown_types_are_suppressed(value: Any) -> None:
     out = _apply({"v": value, "kept": "yes"})
     assert out.get("kept") == "yes"
-    assert not contains_instance(out, type(value))
+    # Identity, not isinstance: every value is an instance of ``object``.
+    assert "v" not in out
+    assert all(v is not value for v in out.values())
 
 
 def test_non_string_dict_keys_are_suppressed() -> None:

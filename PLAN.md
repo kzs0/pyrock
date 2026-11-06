@@ -363,3 +363,26 @@ Waves 3b–3d are unchanged.
 - **Concurrency:** calls are serialised by a lock (see the design note in the
   module).
 - **TLS:** a passed `ssl_context` gets ALPN `["h2"]` set on it.
+
+### `attr` / `privacy` / `env` (from I1)
+
+- **`attr._normalize_value(v)`** returns an `AttrValue`, or `None` meaning
+  drop and count. Exceptions are expanded with
+  `attr.error(exc, allow_details=, allow_source_paths=, stack=)`.
+- **`attr._text_value(v)`** returns label or log text. Sequences, exceptions
+  and unknown values give `"_"`.
+- **`Policy.apply(attrs, path="")`** returns a new dict in input order.
+  - Sensitive values become `"[redacted]"`; cycles and aliases become
+    `"[cycle]"` / `"[alias]"`.
+  - Tuples come back as lists.
+  - Values may still be `timedelta`, `datetime`, `bytes` or `None`, so
+    encoders still call `_normalize_value`.
+- **Single values:** `Policy.value(path, v)` returns `(v, keep)`.
+  `Policy.label_value(key, text)` returns `"_"` when the value is dropped.
+  `Policy.message(text)` and `Policy.profile_labels(labels)` round out the
+  helpers.
+- **`Policy.resource(attrs)`:** only `host.`, `process.`, `k8s.` and
+  `container.` keys need `resource_keys`. `attribute_keys` is not applied to
+  resources.
+- **`env.parse`** builds a nested type through its `from_env(environ)` method
+  when it has one. This is how a nested `pyrock.Config` is parsed.

@@ -175,10 +175,10 @@ def _convert(tp: Any, raw: str, sep: str) -> Any:
         return scalar(raw)
     origin = typing.get_origin(tp)
     args = typing.get_args(tp)
-    if origin is list and len(args) == 1:
-        return [_convert_item(args[0], index, item) for index, item in enumerate(_split(raw, sep))]
-    if origin is tuple and len(args) == 2 and args[1] is Ellipsis:
-        return tuple(_convert_item(args[0], i, item) for i, item in enumerate(_split(raw, sep)))
+    homogeneous_tuple = origin is tuple and len(args) == 2 and args[1] is Ellipsis
+    if (origin is list and len(args) == 1) or homogeneous_tuple:
+        items = [_convert_item(args[0], i, item) for i, item in enumerate(_split(raw, sep))]
+        return tuple(items) if homogeneous_tuple else items
     if origin is typing.Literal:
         return _convert_literal(args, raw)
     if isinstance(tp, type) and issubclass(tp, enum.Enum):
