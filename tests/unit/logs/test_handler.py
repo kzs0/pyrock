@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import io
 import json
 import logging
@@ -82,7 +83,7 @@ def test_handler_correlation_is_per_context_across_threads() -> None:
         done.set()
 
     def in_span_body() -> None:
-        t = threading.Thread(target=other_thread)
+        t = threading.Thread(target=contextvars.Context().run, args=(other_thread,))
         t.start()
         t.join()
         log.info("span")

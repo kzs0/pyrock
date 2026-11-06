@@ -453,3 +453,25 @@ Waves 3b–3d are unchanged.
     busy.
   - `.address` is `(host, port)` once started.
   - `.shutdown(timeout=)` is idempotent.
+
+**Amendment to decision 18.** "A plain `threading.Thread` sees the noop"
+holds only when the interpreter does not inherit context into new threads.
+When `sys.flags.thread_inherit_context` is set (the default on free-threaded
+3.14), new threads inherit the caller's context, and with it the active
+instance. That is Python's own behaviour, and pyrock does not fight it.
+Tests that need an empty context run their thread target through
+`contextvars.Context().run`.
+
+### `logs` (from I5)
+
+- **Install:**
+  `restore = logs._install(target, level=, log_format=, stream=, service=,
+  static_attrs=, policy=, add_source=)`.
+  - `target` is `"root"`, `"pyrock"` or `"none"`.
+  - `restore()` is idempotent and safe in any order.
+- **Helpers:**
+  `logging.getLogger(logs.LOGGER_NAME).log(level, msg,
+  extra={logs.ATTRS_KEY: attrs}, exc_info=exc, stacklevel=N)`.
+- **Canonical log:** `logs.log_canonical(logger, operation=, duration_ms=,
+  success=, attributes=, span_context=)`. Failure fields must already be
+  expanded with `attr.error` inside `attributes`.
