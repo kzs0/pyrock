@@ -475,3 +475,16 @@ Tests that need an empty context run their thread target through
 - **Canonical log:** `logs.log_canonical(logger, operation=, duration_ms=,
   success=, attributes=, span_context=)`. Failure fields must already be
   expanded with `attr.error` inside `attributes`.
+
+### `profile` (from I7)
+
+- **Starting an exporter:** `profile.start_export(cfg, *, service, resource=None,
+  policy=None, loops=None)` returns a `ProfileExporter`.
+  - The exporter has `.stats()`, `.stop(timeout=)` and `.running`.
+  - `ProfileExportStats` supports `+`.
+- **Debug handler:** `profile.debug.app(*, max_seconds=30.0,
+  prefix="/debug/pprof", loops=None)`.
+- **Fork:** the fork hook calls `profile._locks.reset()` in the child.
+- **Deviations from DESIGN**, to be recorded in the Phase 4 docs:
+  - CPU samples carry no asyncio task label.
+  - The first profile collection runs immediately on start.

@@ -267,8 +267,9 @@ class SamplingProfiler:
         with self._lock:
             thread, self._thread = self._thread, None
             owned, self._owns = self._owns, False
+            if thread is not None:
+                self._wake.set()
         if thread is not None:
-            self._wake.set()
             thread.join()
         if owned:
             release_ownership()
@@ -311,8 +312,7 @@ class SamplingProfiler:
         with self._lock:
             frames = self._stacks.frames
             samples = tuple(
-                Sample(frames(key), (count, value))
-                for key, (count, value) in self._totals.items()
+                Sample(frames(key), (count, value)) for key, (count, value) in self._totals.items()
             )
             profile = Profile(
                 sample_types=(_SAMPLES, _CPU if self._cpu else _WALL),
