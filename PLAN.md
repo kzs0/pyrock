@@ -386,3 +386,25 @@ Waves 3b–3d are unchanged.
   resources.
 - **`env.parse`** builds a nested type through its `from_env(environ)` method
   when it has one. This is how a nested `pyrock.Config` is parsed.
+
+### `metric` (from I3)
+
+- **Building the registry:**
+  `Registry(prefix, buckets=, const_labels=<static attrs after the policy>,
+  series_limit=, family_limit=, label_filter=policy.label_value)`.
+  `buckets=None` means the defaults.
+- **Operation metrics:** register `reg.counter(f"{name}_count", help,
+  labels=...)`, plus `_successes`, `_failures`, and
+  `reg.histogram(f"{name}_duration_ms", ...)`. Registration is cached for
+  the same schema.
+  - A declared label that collides with a constant (static) label raises.
+    The core must drop static-attr keys from `metric_labels` before
+    registering.
+- **Recording:** `metric.labels({k: v ...}).inc()` and `.observe(ms)`.
+  Missing keys become `"_"`; undeclared keys raise `ValueError`.
+- **Exposition:** `prometheus.encode(reg)` returns bytes, served with
+  `prometheus.CONTENT_TYPE`. On `ExpositionError`, respond 500 with an empty
+  body.
+- **Fork:** `reg.reset()` is safe in `after_in_child`.
+- **Runtime metrics:** `RuntimeCollector(reg)` registers itself.
+  `.track_loop(loop)` adds a loop, and `.close()` unregisters the collector.
