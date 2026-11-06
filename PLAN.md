@@ -408,3 +408,36 @@ Waves 3b–3d are unchanged.
 - **Fork:** `reg.reset()` is safe in `after_in_child`.
 - **Runtime metrics:** `RuntimeCollector(reg)` registers itself.
   `.track_loop(loop)` adds a loop, and `.close()` unregisters the collector.
+
+### `trace` / `trace.otlp` (from I2)
+
+- **Setup:**
+  - `BatchProcessor(exporter, max_queue_size=, max_batch_size=,
+    schedule_delay=, export_timeout=)`.
+  - `Tracer(service=, resource=static_attrs, sampler=, processor=,
+    policy=)`. A tracer has one processor slot, replaceable with
+    `tracer.set_processor(p)`. Fan-out happens at the exporter level.
+  - Exporters take `tracer.resource`, which is already filtered by the
+    policy:
+    - `HTTPExporter(url, service=, resource=, headers=, timeout=,
+      ssl_context=)`;
+    - `GRPCExporter(endpoint, service=, resource=, headers=, insecure=,
+      timeout=, ssl_context=)`. Import its module lazily.
+- **Spans:**
+  - Start with `tracer.start_span(name, parent=Span|SpanContext|None,
+    kind=, attrs=)`. A remote parent is passed as a `SpanContext`.
+  - Activate with `token = use_span(span)`, deactivate with
+    `token.var.reset(token)`. Read back with `current_span()` and
+    `current_span_context()`.
+  - Data: `span.set_attrs(mapping)`, `span.add_event(name, attrs)`,
+    `span.record_exception(exc, attrs)`, `span.set_status(StatusCode.ERROR,
+    msg)`.
+  - Exception-valued attributes must be expanded with `attr.error()` before
+    setting them; the policy drops raw exceptions.
+  - `span.end()` exports only sampled spans.
+- **Lifecycle:** `bp.stats()` returns `BatchStats`.
+  `tracer.force_flush(timeout=)` returns a bool, and
+  `tracer.shutdown(timeout=)` also shuts down the processor and exporter.
+- **Fork:** call `bp._after_fork_in_child()` from `after_in_child`. Wrapping
+  exporters (retry and fan-out in `_cloud`) must forward
+  `_after_fork_in_child` to the exporters they wrap.

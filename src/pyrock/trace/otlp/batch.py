@@ -199,7 +199,9 @@ class BatchProcessor:
     def _locked_batch_due(self) -> bool:
         queue = self._queue
         return bool(queue) and (
-            len(queue) >= self._max_batch_size or self._shut_down or self._flush_target > self._taken
+            len(queue) >= self._max_batch_size
+            or self._shut_down
+            or self._flush_target > self._taken
         )
 
     def _export(self, batch: list[Span]) -> None:

@@ -362,7 +362,7 @@ def test_stats_under_concurrency(exporter: FakeExporter) -> None:
     finally:
         bp.shutdown()
     assert stats == BatchStats(exported=4000, dropped=0, failed=0, queue_len=0)
-    assert sorted(exporter.exported) == sorted(f"t{t}.s{i}" for t in range(8) for i in range(500))
+    assert sorted(exporter.exported) == sorted(f"t{t}.{i}" for t in range(8) for i in range(500))
 
 
 # -------------------------------------------------------------- failures
