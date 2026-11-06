@@ -11,15 +11,17 @@ from __future__ import annotations
 
 import contextvars
 import enum
+import os
+import threading
+import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from types import MappingProxyType
+from typing import Protocol, runtime_checkable
 
-from pyrock.attr import AttrValue
-
-if TYPE_CHECKING:
-    from pyrock.privacy import Policy
-    from pyrock.trace.sampler import Sampler
+from pyrock.attr import AttrValue, error
+from pyrock.privacy import Policy
+from pyrock.trace.sampler import AlwaysOn, ParentBased, Sampler
 
 __all__ = [
     "INVALID_SPAN_ID",
@@ -43,6 +45,7 @@ __all__ = [
 ]
 
 INVALID_TRACE_ID = bytes(16)
+INVALID_SPAN_ID = bytes(8)
 
 
 def _is_str(value: object) -> bool:
@@ -51,9 +54,6 @@ def _is_str(value: object) -> bool:
 
 def _is_bytes_of(value: object, size: int) -> bool:
     return isinstance(value, bytes) and len(value) == size
-
-
-INVALID_SPAN_ID = bytes(8)
 
 
 class SpanKind(enum.IntEnum):
@@ -224,17 +224,49 @@ class SpanEvent:
 
 
 def new_trace_id() -> bytes:
-    """Return a random, non-zero 16-byte trace ID."""
-    raise NotImplementedError
+    """Return a random, non-zero 16-byte trace ID (from :func:`os.urandom`, fork-safe)."""
+    while (trace_id := os.urandom(16)) == INVALID_TRACE_ID:
+        pass
+    return trace_id
 
 
 def new_span_id() -> bytes:
-    """Return a random, non-zero 8-byte span ID."""
-    raise NotImplementedError
+    """Return a random, non-zero 8-byte span ID (from :func:`os.urandom`, fork-safe)."""
+    while (span_id := os.urandom(8)) == INVALID_SPAN_ID:
+        pass
+    return span_id
+
+
+_SAMPLED = 0x01
+_UNSET_STATUS: tuple[StatusCode, str] = (StatusCode.UNSET, "")
 
 
 class Span:
-    """A unit of traced work. Thread-safe; mutations after :meth:`end` are ignored."""
+    """A unit of traced work. Thread-safe; mutations after :meth:`end` are ignored.
+
+    A span created by a :class:`Tracer` cleans every attribute, event and
+    status message with the tracer's privacy policy as it is recorded. Its end
+    time defaults to the start time plus the elapsed monotonic time, so a wall
+    clock step never yields a negative duration.
+    """
+
+    __slots__ = (
+        "_attrs",
+        "_context",
+        "_end_ns",
+        "_ended",
+        "_events",
+        "_kind",
+        "_live",
+        "_lock",
+        "_name",
+        "_parent",
+        "_policy",
+        "_start_mono",
+        "_start_ns",
+        "_status",
+        "_tracer",
+    )
 
     def __init__(
         self,
@@ -248,66 +280,116 @@ class Span:
         tracer: Tracer | None = None,
         recording: bool = True,
     ) -> None:
-        raise NotImplementedError
+        # Wall clock first, then the monotonic anchor: derived times never run ahead.
+        self._start_ns = time.time_ns() if start_time_ns is None else start_time_ns
+        self._start_mono = time.perf_counter_ns()
+        self._name = name
+        self._context = context
+        self._parent = parent
+        self._kind = kind
+        self._tracer = tracer
+        self._policy = None if tracer is None else tracer._policy
+        self._attrs: dict[str, AttrValue] = self._clean(attrs) if recording and attrs else {}
+        self._events: list[SpanEvent] | None = None
+        self._status = _UNSET_STATUS
+        self._end_ns: int | None = None
+        self._ended = False
+        self._live = recording
+        self._lock = threading.Lock()
+
+    # -- read-only state ---------------------------------------------------
 
     @property
     def name(self) -> str:
-        raise NotImplementedError
+        """The span name."""
+        return self._name
 
     @property
     def context(self) -> SpanContext:
-        raise NotImplementedError
+        """This span's identity (trace ID, span ID, flags, trace state)."""
+        return self._context
 
     @property
     def parent(self) -> SpanContext | None:
-        raise NotImplementedError
+        """The parent's context (local or remote), or ``None`` for a root span."""
+        return self._parent
 
     @property
     def kind(self) -> SpanKind:
-        raise NotImplementedError
+        """The span kind."""
+        return self._kind
 
     @property
     def start_time_ns(self) -> int:
-        raise NotImplementedError
+        """Start time in nanoseconds since the Unix epoch."""
+        return self._start_ns
 
     @property
     def end_time_ns(self) -> int | None:
-        raise NotImplementedError
+        """End time in nanoseconds since the Unix epoch, or ``None`` while running."""
+        with self._lock:
+            return self._end_ns
 
     @property
     def attrs(self) -> Mapping[str, AttrValue]:
         """A snapshot of the span attributes."""
-        raise NotImplementedError
+        with self._lock:
+            if self._ended:  # frozen from now on: share instead of copying
+                return MappingProxyType(self._attrs)
+            return dict(self._attrs)
 
     @property
     def events(self) -> Sequence[SpanEvent]:
         """A snapshot of the span events."""
-        raise NotImplementedError
+        with self._lock:
+            return tuple(self._events or ())
 
     @property
     def status(self) -> tuple[StatusCode, str]:
         """``(code, message)``."""
-        raise NotImplementedError
+        with self._lock:
+            return self._status
 
     @property
     def ended(self) -> bool:
-        raise NotImplementedError
+        """Whether :meth:`end` has been called."""
+        with self._lock:
+            return self._ended
 
     @property
     def is_recording(self) -> bool:
         """False for spans that will not be exported (dropped by sampling, or ended)."""
-        raise NotImplementedError
+        return self._live
 
     @property
     def duration(self) -> float | None:
         """Seconds between start and end, or ``None`` while running."""
-        raise NotImplementedError
+        end = self.end_time_ns
+        return None if end is None else (end - self._start_ns) / 1e9
+
+    # -- mutation ----------------------------------------------------------
 
     def set_attr(self, key: str, value: AttrValue, /) -> None:
-        raise NotImplementedError
+        """Set one attribute (privacy-filtered; a dropped value leaves the key unset)."""
+        if not self._live:
+            return
+        policy = self._policy
+        if policy is not None:
+            value, keep = policy.value(key, value)
+            if not keep:
+                return
+        with self._lock:
+            if self._live:
+                self._attrs[key] = value
 
     def set_attrs(self, attrs: Mapping[str, AttrValue], /) -> None:
-        raise NotImplementedError
+        """Merge several attributes (privacy-filtered); later values win."""
+        if not self._live or not attrs:
+            return
+        cleaned = self._clean(attrs)
+        with self._lock:
+            if self._live:
+                self._attrs.update(cleaned)
 
     def add_event(
         self,
@@ -317,20 +399,78 @@ class Span:
         *,
         timestamp_ns: int | None = None,
     ) -> None:
-        raise NotImplementedError
+        """Record a named event, timestamped now unless ``timestamp_ns`` is given."""
+        if not self._live:
+            return
+        event = SpanEvent(
+            name,
+            self._now_ns() if timestamp_ns is None else timestamp_ns,
+            self._clean(attrs) if attrs else {},
+        )
+        with self._lock:
+            if self._live:
+                if self._events is None:
+                    self._events = [event]
+                else:
+                    self._events.append(event)
 
     def record_exception(
         self, exc: BaseException, /, attrs: Mapping[str, AttrValue] | None = None
     ) -> None:
-        """Add an ``exception`` event (privacy-filtered)."""
-        raise NotImplementedError
+        """Add an ``exception`` event (privacy-filtered).
+
+        The event carries :func:`pyrock.attr.error` attributes (``error.type``,
+        ``error.fingerprint``, ...; ``error.message`` only when the policy
+        allows error details) plus ``attrs``. The status is left unchanged.
+        """
+        if not self._live:
+            return
+        policy = self._policy
+        event_attrs = error(
+            exc,
+            allow_details=policy is not None and policy.allow_error_details,
+            allow_source_paths=policy is not None and policy.allow_source_paths,
+        )
+        if attrs:
+            event_attrs.update(attrs)
+        self.add_event("exception", event_attrs)
 
     def set_status(self, code: StatusCode, message: str = "", /) -> None:
-        raise NotImplementedError
+        """Set the status; the message is cleaned by the privacy policy."""
+        if not self._live:
+            return
+        if self._policy is not None:
+            message = self._policy.message(message)
+        with self._lock:
+            if self._live:
+                self._status = (code, message)
 
     def end(self, *, end_time_ns: int | None = None) -> None:
-        """End the span (idempotent) and hand it to the tracer's processor."""
-        raise NotImplementedError
+        """End the span (idempotent) and hand it to the tracer's processor if sampled."""
+        with self._lock:
+            if self._ended:
+                return
+            self._ended = True
+            self._live = False
+            self._end_ns = self._now_ns() if end_time_ns is None else end_time_ns
+        tracer = self._tracer
+        if tracer is not None and self._context.trace_flags & _SAMPLED:
+            processor = tracer._processor
+            if processor is not None:
+                processor.on_end(self)
+
+    # -- helpers -----------------------------------------------------------
+
+    def _now_ns(self) -> int:
+        return self._start_ns + (time.perf_counter_ns() - self._start_mono)
+
+    def _clean(self, attrs: Mapping[str, AttrValue]) -> dict[str, AttrValue]:
+        policy = self._policy
+        return dict(attrs) if policy is None else policy.apply(attrs)
+
+    def __repr__(self) -> str:
+        ctx = self._context
+        return f"Span({self._name!r}, trace_id={ctx.trace_id_hex}, span_id={ctx.span_id_hex})"
 
 
 @runtime_checkable
@@ -354,7 +494,15 @@ class SpanProcessor(Protocol):
 
 
 class Tracer:
-    """Creates spans, applies sampling and the data policy, and hands ended spans off."""
+    """Creates spans, applies sampling and the data policy, and hands ended spans off.
+
+    ``policy`` defaults to :class:`pyrock.privacy.Policy` defaults; the
+    resource is filtered with :meth:`~pyrock.privacy.Policy.resource` once, at
+    construction. ``sampler`` defaults to ``ParentBased(AlwaysOn())``. Only
+    sampled spans reach ``processor``.
+    """
+
+    __slots__ = ("_policy", "_processor", "_resource", "_sampler", "_service")
 
     def __init__(
         self,
@@ -365,23 +513,32 @@ class Tracer:
         processor: SpanProcessor | None = None,
         policy: Policy | None = None,
     ) -> None:
-        raise NotImplementedError
+        self._service = service
+        self._policy = Policy() if policy is None else policy
+        self._resource: Mapping[str, AttrValue] = MappingProxyType(
+            self._policy.resource(resource or {})
+        )
+        self._sampler: Sampler = ParentBased(AlwaysOn()) if sampler is None else sampler
+        self._processor = processor
 
     @property
     def service(self) -> str:
-        raise NotImplementedError
+        """The ``service.name`` resource attribute."""
+        return self._service
 
     @property
     def resource(self) -> Mapping[str, AttrValue]:
-        raise NotImplementedError
+        """Resource attributes, already filtered by the privacy policy."""
+        return self._resource
 
     @property
     def processor(self) -> SpanProcessor | None:
-        raise NotImplementedError
+        """The processor that receives sampled, ended spans."""
+        return self._processor
 
     def set_processor(self, processor: SpanProcessor | None, /) -> None:
         """Replace the span processor (used by cloud wiring)."""
-        raise NotImplementedError
+        self._processor = processor
 
     def start_span(
         self,
@@ -393,11 +550,48 @@ class Tracer:
         attrs: Mapping[str, AttrValue] | None = None,
         start_time_ns: int | None = None,
     ) -> Span:
-        """Start a span. ``parent=None`` starts a new trace; a remote context continues one."""
-        raise NotImplementedError
+        """Start a span. ``parent=None`` starts a new trace; a remote context continues one.
+
+        An invalid parent context is treated as absent. The child keeps the
+        parent's trace ID and trace state; the sampler sees the parent's
+        *sampled* flag (``None`` for a root span).
+        """
+        parent_ctx = parent.context if isinstance(parent, Span) else parent
+        parent_sampled: bool | None
+        if parent_ctx is not None and parent_ctx.is_valid:
+            trace_id = parent_ctx.trace_id
+            trace_state = parent_ctx.trace_state
+            parent_sampled = bool(parent_ctx.trace_flags & _SAMPLED)
+        else:
+            parent_ctx = None
+            trace_id = new_trace_id()
+            trace_state = _EMPTY_TRACE_STATE
+            parent_sampled = None
+        result = self._sampler.should_sample(trace_id, name, parent_sampled)
+        if result.attrs:
+            attrs = {**(attrs or {}), **result.attrs}
+        context = SpanContext(trace_id, new_span_id(), int(result.sampled), trace_state)
+        return Span(
+            name,
+            context,
+            parent=parent_ctx,
+            kind=kind,
+            attrs=attrs,
+            start_time_ns=start_time_ns,
+            tracer=self,
+            recording=result.recording,
+        )
+
+    def force_flush(self, *, timeout: float | None = None) -> bool:
+        """Flush the processor; ``True`` when there is nothing left to export."""
+        processor = self._processor
+        return True if processor is None else processor.force_flush(timeout=timeout)
 
     def shutdown(self, *, timeout: float | None = None) -> None:
-        raise NotImplementedError
+        """Shut the processor down (flushing what it holds)."""
+        processor = self._processor
+        if processor is not None:
+            processor.shutdown(timeout=timeout)
 
 
 _current_span: contextvars.ContextVar[Span | None] = contextvars.ContextVar(
@@ -407,17 +601,18 @@ _current_span: contextvars.ContextVar[Span | None] = contextvars.ContextVar(
 
 def current_span() -> Span | None:
     """Return the innermost live span in this context, or ``None``."""
-    raise NotImplementedError
+    return _current_span.get()
 
 
 def current_span_context() -> SpanContext | None:
     """Return the innermost span's context, or ``None``."""
-    raise NotImplementedError
+    span = _current_span.get()
+    return None if span is None else span._context
 
 
 def use_span(span: Span | None, /) -> contextvars.Token[Span | None]:
     """Make ``span`` current; pass the returned token to ``ContextVar.reset``."""
-    raise NotImplementedError
+    return _current_span.set(span)
 
 
 # Re-exported last: pyrock.trace.propagator imports SpanContext from here.

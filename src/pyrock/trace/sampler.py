@@ -72,42 +72,61 @@ class Sampler(Protocol):
     ) -> SamplingResult: ...
 
 
+_ID_SPACE = 1 << 64
+_SAMPLE = SamplingResult(Decision.RECORD_AND_SAMPLE)
+_DROP = SamplingResult(Decision.DROP)
+
+
 class AlwaysOn:
     """Samples every span (Go: ``AlwaysSampler``)."""
+
+    __slots__ = ()
 
     def should_sample(
         self, trace_id: bytes, name: str, parent_sampled: bool | None
     ) -> SamplingResult:
-        raise NotImplementedError
+        """Always ``RECORD_AND_SAMPLE``."""
+        return _SAMPLE
 
 
 class AlwaysOff:
     """Drops every span (Go: ``NeverSampler``)."""
 
+    __slots__ = ()
+
     def should_sample(
         self, trace_id: bytes, name: str, parent_sampled: bool | None
     ) -> SamplingResult:
-        raise NotImplementedError
+        """Always ``DROP``."""
+        return _DROP
 
 
 class Ratio:
     """Samples ``ratio`` of traces, deterministically on the trace ID (Go: ``RatioSampler``).
 
     Unlike Go (random per span), the decision depends only on the trace ID's
-    low 8 bytes. ``ratio`` must be in ``[0, 1]``; ``ValueError`` otherwise.
+    low 8 bytes: a trace is sampled when that unsigned 64-bit number is below
+    ``ratio * 2**64``. ``ratio`` must be in ``[0, 1]``; ``ValueError`` otherwise.
     """
 
+    __slots__ = ("_bound", "_ratio")
+
     def __init__(self, ratio: float, /) -> None:
-        raise NotImplementedError
+        if not 0.0 <= ratio <= 1.0:  # also rejects NaN
+            raise ValueError(f"ratio must be in [0, 1], got {ratio!r}")
+        self._ratio = ratio
+        self._bound = int(ratio * _ID_SPACE)
 
     @property
     def ratio(self) -> float:
-        raise NotImplementedError
+        """The configured sampling ratio."""
+        return self._ratio
 
     def should_sample(
         self, trace_id: bytes, name: str, parent_sampled: bool | None
     ) -> SamplingResult:
-        raise NotImplementedError
+        """Sample when the trace ID's low 8 bytes fall below the ratio bound."""
+        return _SAMPLE if int.from_bytes(trace_id[8:16]) < self._bound else _DROP
 
 
 class ParentBased:
@@ -118,14 +137,20 @@ class ParentBased:
     unsampled.
     """
 
+    __slots__ = ("_root",)
+
     def __init__(self, root: Sampler, /) -> None:
-        raise NotImplementedError
+        self._root = root
 
     @property
     def root(self) -> Sampler:
-        raise NotImplementedError
+        """The sampler consulted for root spans."""
+        return self._root
 
     def should_sample(
         self, trace_id: bytes, name: str, parent_sampled: bool | None
     ) -> SamplingResult:
-        raise NotImplementedError
+        """Follow ``parent_sampled``; delegate to ``root`` when there is no parent."""
+        if parent_sampled is None:
+            return self._root.should_sample(trace_id, name, None)
+        return _SAMPLE if parent_sampled else _DROP
