@@ -1,14 +1,18 @@
 """Context variables and helpers that carry context across threads.
 
-asyncio needs nothing extra (tasks copy the context). Threads start with an
-empty context, so pyrock provides explicit helpers: :func:`bind`,
-:class:`ContextThreadPoolExecutor` and :class:`Thread`. ``asyncio.to_thread``
-already copies context.
+pyrock keeps no process-wide state: the active instance, operation, step,
+source and the no-trace flag live in :mod:`contextvars`. asyncio needs nothing
+extra (tasks copy the context, and ``asyncio.to_thread`` does too). Threads
+start with an empty context unless the interpreter inherits it
+(``sys.flags.thread_inherit_context``, the default on free-threaded 3.14), so
+pyrock provides explicit helpers: :func:`bind`, :class:`ContextThreadPoolExecutor`
+and :class:`Thread`.
 """
 
 from __future__ import annotations
 
 import contextvars
+import functools
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -35,16 +39,29 @@ R = TypeVar("R")
 bedrock_var: contextvars.ContextVar[Bedrock | None] = contextvars.ContextVar(
     "pyrock.bedrock", default=None
 )
+"""The active live instance (never the noop: deactivated means ``None``)."""
+
 operation_var: contextvars.ContextVar[Operation | None] = contextvars.ContextVar(
     "pyrock.operation", default=None
 )
+"""The innermost operation."""
+
 step_var: contextvars.ContextVar[Step | None] = contextvars.ContextVar("pyrock.step", default=None)
+"""The innermost step *inside* the innermost operation.
+
+Entering an operation clears it, so a non-``None`` value always means the step
+is the innermost scope (what ``pyrock.register()`` targets).
+"""
+
 source_var: contextvars.ContextVar[Source | None] = contextvars.ContextVar(
     "pyrock.source", default=None
 )
+"""The innermost source; it prefixes every operation opened beneath it."""
+
 no_trace_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "pyrock.no_trace", default=False
 )
+"""Set by ``no_trace=True`` scopes and inherited by everything below them."""
 
 
 @overload
@@ -61,16 +78,32 @@ def bind(fn: Callable[..., R], /, *args: Any, **kwargs: Any) -> Callable[..., R]
     ``bind(fn)`` returns a wrapper with ``fn``'s signature. ``bind(fn, *args,
     **kwargs)`` pre-binds arguments like :func:`functools.partial`. Each call
     runs in a fresh copy of the captured context, so concurrent calls do not
-    interfere.
+    interfere and nothing a call activates leaks into the next one.
     """
-    raise NotImplementedError
+    captured = contextvars.copy_context()
+    if not args and not kwargs:
+
+        @functools.wraps(fn)
+        def bound(*call_args: Any, **call_kwargs: Any) -> R:
+            return captured.copy().run(fn, *call_args, **call_kwargs)
+
+        return bound
+
+    def partial(*call_args: Any, **call_kwargs: Any) -> R:
+        return captured.copy().run(fn, *args, *call_args, **{**kwargs, **call_kwargs})
+
+    return partial
 
 
 class ContextThreadPoolExecutor(ThreadPoolExecutor):
-    """A :class:`ThreadPoolExecutor` that copies the caller's context on every submit."""
+    """A :class:`ThreadPoolExecutor` that copies the caller's context on every submit.
+
+    :meth:`map` goes through :meth:`submit`, so it copies context too.
+    """
 
     def submit(self, fn: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs) -> Future[R]:
-        raise NotImplementedError
+        context = contextvars.copy_context()
+        return super().submit(context.run, fn, *args, **kwargs)
 
 
 class Thread(threading.Thread):
@@ -94,7 +127,8 @@ class Thread(threading.Thread):
         executes inside it, as on 3.14 (pass ``contextvars.Context()`` for an
         empty context).
         """
-        raise NotImplementedError
+        super().__init__(group, target, name, args, kwargs, daemon=daemon)
+        self._pyrock_context = contextvars.copy_context() if context is None else context
 
     def run(self) -> None:
-        raise NotImplementedError
+        self._pyrock_context.run(super().run)
