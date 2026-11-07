@@ -257,7 +257,7 @@ class _Walk:
             return _DROP
         flags = _classify(path)
         if flags:
-            verdict = policy._verdict(path, flags, container=container)
+            verdict = policy._verdict(path, flags, group=isinstance(value, Mapping))
             if verdict is not None:
                 return verdict
         if policy.redact is not None:
@@ -467,14 +467,18 @@ class Policy:
             return _Match.PARTIAL  # the root is a group; its keys are filtered
         return self._admit(path)
 
-    def _verdict(self, path: str, flags: int, *, container: bool) -> str | _Drop | None:
-        """Apply the path rules: a marker, ``_DROP``, or ``None`` to keep going."""
+    def _verdict(self, path: str, flags: int, *, group: bool) -> str | _Drop | None:
+        """Apply the path rules: a marker, ``_DROP``, or ``None`` to keep going.
+
+        ``group`` is true for mappings: an error summary key holding a mapping
+        is a private group, while a list such as ``error.chain`` stays public.
+        """
         if flags & _SOURCE_PATH and not self.allow_source_paths:
             return _REDACTED
         if flags & _SENSITIVE:
             return _REDACTED
         if not self.allow_error_details and (
-            flags & _ERROR_DETAIL or (flags & _ERROR_SUMMARY and container)
+            flags & _ERROR_DETAIL or (flags & _ERROR_SUMMARY and group)
         ):
             return _REDACTED
         if flags & _RAW_HTTP and not (

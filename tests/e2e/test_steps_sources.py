@@ -233,7 +233,7 @@ def test_source_aggregates_use_prefixed_names_and_source_labels() -> None:
         src.gauge("queue_depth", 42)
         src.histogram("latency_ms", 52.3)
     exposition = prom_text(t)
-    labels = {"worker.type": "async", "env": "test"}
+    labels = {"worker_type": "async", "env": "test"}
     assert exposition.type("background_worker_jobs_processed") == "counter"
     assert exposition.value("background_worker_jobs_processed", labels) == 3
     assert exposition.type("background_worker_queue_depth") == "gauge"

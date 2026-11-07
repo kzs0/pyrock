@@ -199,7 +199,10 @@ def test_profile_stats_count_exports(otlp_collector: OTLPHTTPCollector) -> None:
 
     with running(profiles=_config(otlp_collector, types=[ProfileType.HEAP])) as b:
         otlp_collector.wait_for_profiles(2)
-        stats = b.profile_stats()
+        # The collector sees an upload before the exporter has counted it.
+        deadline = time.monotonic() + 5.0
+        while (stats := b.profile_stats()).exported < 2 and time.monotonic() < deadline:
+            pause(0.01)
     assert stats.exported >= 2
     assert stats.failed == 0
 
@@ -365,8 +368,14 @@ def test_mutex_profile_records_instrumented_lock_contention(
         pause(0.1)  # the waiter is now blocked inside acquire()
         lock.release()
         waiter.join(5)
-        req = _wait_for_type(otlp_collector, "mutex")
-    assert b"_contend_on_instrumented_lock" in body(req)
+        # The first upload may predate the contention; wait for one that has it.
+        deadline = time.monotonic() + 5.0
+        while not any(
+            b"_contend_on_instrumented_lock" in body(r) for r in _of_type(otlp_collector, "mutex")
+        ):
+            assert time.monotonic() < deadline, "no mutex profile with the contended frame"
+            _wait_for_type(otlp_collector, "mutex")
+            otlp_collector.wait_for_profiles(len(otlp_collector.profile_requests()) + 1)
 
 
 def test_instrumented_lock_behaves_like_threading_lock() -> None:

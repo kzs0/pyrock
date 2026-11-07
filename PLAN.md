@@ -488,3 +488,28 @@ Tests that need an empty context run their thread target through
 - **Deviations from DESIGN**, to be recorded in the Phase 4 docs:
   - CPU samples carry no asyncio task label.
   - The first profile collection runs immediately on start.
+
+### Core (from I8), the interface for wave 3d
+
+- **Active instance:** `pyrock.current()` returns the active instance. Check
+  `.is_noop` before using it. A pinned `b.operation(...)` activates `b` for
+  the duration of the operation.
+- **Operations:** `b.operation(name, attrs=, metric_labels=, kind=,
+  remote_parent=, expected=)` is a sync and async context manager. Use
+  `b.start_operation(...)` for a manual lifecycle: `op.activate()` returns an
+  `Activation`, then call `op.deactivate(act)` and `op.end(error=/success=)`.
+- **Accessors:** `b.tracer`, `b.metrics`, `b.policy`, `b.logger`,
+  `b.static_attrs`, `b.config`, `b.trace_export_stats()`.
+- **Cloud wiring:**
+  - `Bedrock.__init__` calls `pyrock._cloud.wire(self, cloud_config)` after
+    the server and profiles start. Shutdown calls
+    `wiring.stop(timeout=remaining)`, and fork children call
+    `wiring._after_fork_in_child()`.
+  - For trace fan-out: the local exporter is
+    `b.tracer.processor.exporter`, or `None` when no URL is set. Build a new
+    `BatchProcessor` and swap it in with `b.tracer.set_processor`. Do not shut
+    down the old processor.
+  - Profile push uses `b.start_profile_export(cfg)`. Metrics push uses
+    `prometheus.encode(b.metrics)`.
+- **Performance to revisit in Phase 4:** an active operation's enter/exit
+  costs about 11 µs, against about 0.5 µs on the noop path.

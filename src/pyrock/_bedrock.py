@@ -604,14 +604,7 @@ class Bedrock:
     ) -> OperationScope:
         """Open an operation recorded by this instance (active for the scope's duration)."""
         return OperationScope(
-            name,
-            attrs=attrs,
-            metric_labels=metric_labels,
-            no_trace=no_trace,
-            remote_parent=remote_parent,
-            kind=kind,
-            expected=expected,
-            bedrock=self,
+            name, attrs, metric_labels, no_trace, remote_parent, kind, expected, self
         )
 
     def start_operation(

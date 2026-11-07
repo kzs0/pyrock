@@ -46,6 +46,7 @@ import functools
 import inspect
 import threading
 import time
+from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable, Generator, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType, TracebackType
@@ -821,7 +822,7 @@ NOOP_SOURCE = NoopSource()
 # ------------------------------------------------------------------------ scopes
 
 
-class _Scope(Generic[L]):
+class _Scope(ABC, Generic[L]):
     """Shared context-manager/decorator protocol for scopes.
 
     Each ``with`` entry (or decorated call) starts a new live object; a scope
@@ -843,13 +844,13 @@ class _Scope(Generic[L]):
         self._disabled = bedrock is not None and bedrock.is_noop
         self._bedrock = None if self._disabled else bedrock
 
+    @abstractmethod
     def _noop(self) -> L:
         """The preallocated noop live object."""
-        raise NotImplementedError
 
+    @abstractmethod
     def _start(self, bedrock: Bedrock) -> L:
         """Create the live object for one entry (not yet current)."""
-        raise NotImplementedError
 
     def _instance(self) -> Bedrock | None:
         if self._disabled:
@@ -868,6 +869,8 @@ class _Scope(Generic[L]):
         return live
 
     def __enter__(self) -> L:
+        if self._bedrock is None and not self._disabled and bedrock_var.get() is None:
+            return self._noop()  # fast path: nothing active
         return self._enter()
 
     async def __aenter__(self) -> L:
@@ -1054,8 +1057,6 @@ class OperationScope(_Scope[Operation]):
     def __init__(
         self,
         name: str,
-        /,
-        *,
         attrs: Mapping[str, AttrValue] | None,
         metric_labels: Iterable[str],
         no_trace: bool,
@@ -1063,8 +1064,14 @@ class OperationScope(_Scope[Operation]):
         kind: SpanKind,
         expected: ExpectedExceptions,
         bedrock: Bedrock | None,
+        /,
     ) -> None:
-        super().__init__(bedrock)
+        """Positional only: built on every ``pyrock.operation(...)`` call, so kept lean."""
+        if bedrock is None:  # the common case, inlined from _Scope.__init__
+            self._bedrock = None
+            self._disabled = False
+        else:
+            _Scope.__init__(self, bedrock)
         self._name = name
         self._attrs = attrs
         self._labels = metric_labels if type(metric_labels) is tuple else tuple(metric_labels)
@@ -1182,14 +1189,7 @@ def operation(
     direct children of a source are never numbered.
     """
     return OperationScope(
-        name,
-        attrs=attrs,
-        metric_labels=metric_labels,
-        no_trace=no_trace,
-        remote_parent=remote_parent,
-        kind=kind,
-        expected=expected,
-        bedrock=bedrock,
+        name, attrs, metric_labels, no_trace, remote_parent, kind, expected, bedrock
     )
 
 
