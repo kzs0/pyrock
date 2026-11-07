@@ -26,7 +26,7 @@ and profile labels:
   ``attribute_keys`` is ``None``. URLs always lose credentials, query and
   fragment (:func:`sanitize_url`).
 
-This is a leaf module: it imports nothing from pyrock.
+This is a leaf module: it imports only the :mod:`pyrock._compat` utilities.
 """
 
 from __future__ import annotations
@@ -35,10 +35,11 @@ import datetime
 import enum
 import functools
 import re
-import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final
+
+from pyrock._compat import is_nonempty_str, is_positive_int
 
 __all__ = [
     "ALIAS_MARKER",
@@ -47,6 +48,7 @@ __all__ = [
     "MAX_NODES",
     "MAX_PROFILE_LABELS",
     "MAX_PROFILE_LABEL_DEPTH",
+    "REDACTED_MARKER",
     "Policy",
     "Redactor",
     "sanitize_url",
@@ -55,20 +57,14 @@ __all__ = [
 MAX_NODES = 4096
 CYCLE_MARKER = "[cycle]"
 ALIAS_MARKER = "[alias]"
+REDACTED_MARKER: Final = "[redacted]"
+"""Replaces sensitive values and private error details (also used by :mod:`pyrock.logs`)."""
 DEFAULT_MAX_STRING_LENGTH = 1024
 MAX_PROFILE_LABELS = 64
 MAX_PROFILE_LABEL_DEPTH = 8
 
 Redactor = Callable[[str, Any], tuple[Any, bool]]
 """``redact(path, value) -> (new_value, keep)``."""
-
-
-def _is_nonempty_str(value: object) -> bool:
-    return isinstance(value, str) and bool(value)
-
-
-def _is_positive_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _key_tuple(value: Iterable[str] | None, name: str) -> tuple[str, ...] | None:
@@ -78,7 +74,7 @@ def _key_tuple(value: Iterable[str] | None, name: str) -> tuple[str, ...] | None
         raise TypeError(f"{name} must be an iterable of keys, not a single string")
     keys = tuple(value)
     for key in keys:
-        if not _is_nonempty_str(key):
+        if not is_nonempty_str(key):
             raise TypeError(f"{name} entries must be non-empty strings")
     return keys
 
@@ -86,7 +82,6 @@ def _key_tuple(value: Iterable[str] | None, name: str) -> tuple[str, ...] | None
 # -- path rules ----------------------------------------------------------------
 
 _TRUNCATED: Final = "[truncated]"
-_REDACTED: Final = "[redacted]"
 _INVALID_URL: Final = "[invalid URL]"
 _MISSING_LABEL: Final = "_"
 """Same value as ``pyrock.attr.MISSING_LABEL`` (this module may not import it)."""
@@ -182,6 +177,8 @@ _CONTAINER_TYPES: Final = frozenset({dict, list, tuple})
 _SCALAR_TYPES: Final = frozenset(
     {str, bool, int, float, bytes, type(None), datetime.datetime, datetime.timedelta}
 )
+"""Exact types the walker returns unchanged at an unflagged path (``str`` and
+``bytes`` only up to ``max_string_length``)."""
 
 
 def _is_container(value: object) -> bool:
@@ -375,7 +372,7 @@ class Policy:
         object.__setattr__(
             self, "resource_keys", _key_tuple(self.resource_keys, "resource_keys") or ()
         )
-        if not _is_positive_int(self.max_string_length):
+        if not is_positive_int(self.max_string_length):
             raise ValueError("max_string_length must be a positive int")
         if self.redact is not None and not callable(self.redact):
             raise TypeError("redact must be callable")
@@ -390,6 +387,14 @@ class Policy:
         never mutated. Rejected values are omitted; sensitive and private ones
         become ``"[redacted]"``.
         """
+        if (
+            not path
+            and type(attrs) is dict
+            and self.attribute_keys is None
+            and self.redact is None
+            and (flat := self._apply_flat(attrs)) is not None
+        ):
+            return flat
         mode = self._root_mode(path)
         if mode is _Match.NONE:
             return {}
@@ -397,6 +402,8 @@ class Policy:
 
     def value(self, path: str, value: Any, /) -> tuple[Any, bool]:
         """Clean one value at qualified ``path``; returns ``(value, keep)``."""
+        if self.attribute_keys is None and self.redact is None and self._passes_flat(path, value):
+            return value, True
         mode = self._root_mode(path)
         if mode is _Match.NONE:
             return None, False
@@ -456,6 +463,39 @@ class Policy:
             raise ValueError(f"profile labels nest deeper than {MAX_PROFILE_LABEL_DEPTH}")
         return out
 
+    # -- fast path -----------------------------------------------------------
+    #
+    # Most attribute sets are flat dicts of plain scalars under keys no path
+    # rule matches. Without an allowlist or ``redact`` hook the walker returns
+    # such values unchanged, so these helpers skip it. Anything else (a rule
+    # match, a container, a subclass, an over-long value) returns ``None`` /
+    # ``False`` and the caller runs the walker, which stays the single source
+    # of the policy's semantics.
+
+    def _passes_flat(self, key: str, value: Any) -> bool:
+        """Whether the walker would keep ``value`` at ``key`` unchanged."""
+        tp = type(value)
+        if tp not in _SCALAR_TYPES or _classify(key):
+            return False
+        if tp is str or tp is bytes:
+            return len(value) <= self.max_string_length
+        return True
+
+    def _apply_flat(self, attrs: dict[Any, Any]) -> dict[str, Any] | None:
+        """``attrs`` copied when every item passes :meth:`_passes_flat`, else ``None``."""
+        if len(attrs) > MAX_NODES:
+            return None  # the walker truncates at the node budget
+        out: dict[str, Any] = {}
+        passes = self._passes_flat
+        try:
+            for key, value in attrs.items():
+                if type(key) is not str or not passes(key, value):
+                    return None
+                out[key] = value
+        except RuntimeError:  # mutated by another thread: let the walker cope
+            return None
+        return out
+
     # -- helpers used by the walker -----------------------------------------
 
     def _admit(self, path: str) -> _Match:
@@ -474,13 +514,13 @@ class Policy:
         is a private group, while a list such as ``error.chain`` stays public.
         """
         if flags & _SOURCE_PATH and not self.allow_source_paths:
-            return _REDACTED
+            return REDACTED_MARKER
         if flags & _SENSITIVE:
-            return _REDACTED
+            return REDACTED_MARKER
         if not self.allow_error_details and (
             flags & _ERROR_DETAIL or (flags & _ERROR_SUMMARY and group)
         ):
-            return _REDACTED
+            return REDACTED_MARKER
         if flags & _RAW_HTTP and not (
             self.attribute_keys is not None and _match(self.attribute_keys, path) is _Match.FULL
         ):
@@ -532,6 +572,8 @@ def sanitize_url(url: str, /, *, keep_path: bool = True) -> str:
 
     Never raises: an unparseable URL becomes ``"[invalid URL]"``.
     """
+    import urllib.parse  # deferred: keeps ``import pyrock`` fast (it pulls in ipaddress)
+
     try:
         parts = urllib.parse.urlsplit(url)
         _ = parts.port  # validates the port

@@ -20,7 +20,8 @@ Type mapping (OTLP / Prometheus label / log):
 * ``bytes`` -> ``bytesValue`` / base64
 * sequences -> ``arrayValue`` / JSON array; never a metric label (``"_"``)
 * ``BaseException`` -> the error attributes below
-* anything else -> dropped and counted (never ``str()``-ed)
+* anything else -> dropped, never ``str()``-ed (OTLP export reports it in
+  ``droppedAttributesCount``; logs omit it; a metric label becomes ``"_"``)
 
 Error attributes (same keys as Go), with their value types:
 
@@ -33,7 +34,7 @@ Error attributes (same keys as Go), with their value types:
 * exception groups: ``error.group.count`` (``int``) and ``error.types``
   (``list[str]``).
 
-This is a leaf module: it imports nothing from pyrock.
+This is a leaf module: it imports only the :mod:`pyrock._compat` utilities.
 """
 
 from __future__ import annotations
@@ -41,10 +42,11 @@ from __future__ import annotations
 import base64
 import collections
 import datetime
-import hashlib
 from collections.abc import Iterator, Mapping, Sequence
 from types import TracebackType
 from typing import Any, TypeAlias
+
+from pyrock._compat import is_nonempty_str
 
 __all__ = [
     "ERROR_CHAIN",
@@ -93,10 +95,6 @@ MISSING_LABEL = "_"
 """Value used for a declared metric label that was never registered."""
 
 
-def _is_nonempty_str(value: object) -> bool:
-    return isinstance(value, str) and bool(value)
-
-
 class Event:
     """A named event, recorded on the span when registered.
 
@@ -116,7 +114,7 @@ class Event:
         /,
         **kwargs: AttrValue,
     ) -> None:
-        if not _is_nonempty_str(name):
+        if not is_nonempty_str(name):
             raise ValueError("event name must be a non-empty string")
         merged: dict[str, AttrValue] = dict(attrs) if attrs else {}
         merged.update(kwargs)
@@ -130,7 +128,10 @@ class Event:
 
     @property
     def attrs(self) -> Mapping[str, AttrValue]:
-        """A read-only view of the event attributes."""
+        """A copy of the event attributes, as given (values are not yet normalized).
+
+        Mutating the returned mapping does not change the event.
+        """
         return dict(self._attrs)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -384,6 +385,8 @@ def fingerprint(exc: BaseException, /, *, frames: int = 8) -> str:
 
     Line numbers are excluded so the fingerprint survives unrelated edits.
     """
+    import hashlib  # deferred: only error paths need it (keeps ``import pyrock`` fast)
+
     top = collections.deque(_tracebacks(exc), maxlen=max(frames, 0))
     digest = hashlib.blake2b(qualified_name(type(exc)).encode(), digest_size=8)
     for tb in top:

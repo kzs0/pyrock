@@ -46,6 +46,8 @@ __all__ = [
 
 INVALID_TRACE_ID = bytes(16)
 INVALID_SPAN_ID = bytes(8)
+_MAX_TRACESTATE_ENTRIES = 32
+"""W3C limit on ``tracestate`` members; also :data:`pyrock.trace.w3c.MAX_TRACESTATE_ENTRIES`."""
 
 
 def _is_str(value: object) -> bool:
@@ -79,13 +81,14 @@ class TraceState(Mapping[str, str]):
 
     Order is significant: the most recently updated vendor entry comes first.
     Parsing/validation lives in :mod:`pyrock.trace.w3c`; this type only stores
-    entries. At most :data:`pyrock.trace.w3c.MAX_TRACESTATE_ENTRIES` entries are
-    meaningful; constructing a larger state raises ``ValueError``.
+    entries. At most :attr:`MAX_ENTRIES` (the W3C limit, also exported as
+    :data:`pyrock.trace.w3c.MAX_TRACESTATE_ENTRIES`) entries are meaningful;
+    constructing a larger state raises ``ValueError``.
     """
 
     __slots__ = ("_entries", "_index")
 
-    MAX_ENTRIES = 32
+    MAX_ENTRIES = _MAX_TRACESTATE_ENTRIES
 
     _entries: tuple[tuple[str, str], ...]
     _index: dict[str, str]
@@ -150,7 +153,7 @@ class SpanContext:
     """The propagated identity of a span.
 
     ``trace_id`` is 16 bytes, ``span_id`` 8 bytes; ``trace_flags`` bit 0 is
-    *sampled*. Hex forms are computed once and cached.
+    *sampled*. Hex forms are computed on first use and cached.
     """
 
     trace_id: bytes
@@ -168,8 +171,26 @@ class SpanContext:
             raise ValueError("span_id must be 8 bytes")
         if not 0 <= self.trace_flags <= 0xFF:
             raise ValueError("trace_flags must fit in one byte")
-        object.__setattr__(self, "_trace_id_hex", self.trace_id.hex())
-        object.__setattr__(self, "_span_id_hex", self.span_id.hex())
+
+    @classmethod
+    def _trusted(
+        cls, trace_id: bytes, span_id: bytes, trace_flags: int, trace_state: TraceState, /
+    ) -> SpanContext:
+        """A local context from values the tracer produced itself (no validation).
+
+        Private seam for :meth:`Tracer.start_span`: the IDs come from
+        :func:`os.urandom` with the right sizes and the flags are 0 or 1.
+        """
+        context = object.__new__(cls)
+        setattr_ = object.__setattr__
+        setattr_(context, "trace_id", trace_id)
+        setattr_(context, "span_id", span_id)
+        setattr_(context, "trace_flags", trace_flags)
+        setattr_(context, "trace_state", trace_state)
+        setattr_(context, "is_remote", False)
+        setattr_(context, "_trace_id_hex", "")
+        setattr_(context, "_span_id_hex", "")
+        return context
 
     @classmethod
     def from_hex(
@@ -182,7 +203,12 @@ class SpanContext:
         trace_state: TraceState | None = None,
         is_remote: bool = False,
     ) -> SpanContext:
-        """Build a context from lowercase hex IDs (32 and 16 characters)."""
+        """Build a context from hex IDs (32 and 16 characters; either case is accepted).
+
+        Unlike :func:`pyrock.trace.w3c.parse_traceparent`, which follows the
+        W3C rule of lowercase only, this convenience constructor does not check
+        letter case.
+        """
         if len(trace_id) != 32 or len(span_id) != 16:
             raise ValueError("trace_id must be 32 and span_id 16 hex characters")
         return cls(
@@ -196,12 +222,21 @@ class SpanContext:
     @property
     def trace_id_hex(self) -> str:
         """32 lowercase hex characters."""
-        return self._trace_id_hex
+        text = self._trace_id_hex
+        if not text:
+            # A racing thread computes the same text, so the write is benign.
+            text = self.trace_id.hex()
+            object.__setattr__(self, "_trace_id_hex", text)
+        return text
 
     @property
     def span_id_hex(self) -> str:
         """16 lowercase hex characters."""
-        return self._span_id_hex
+        text = self._span_id_hex
+        if not text:
+            text = self.span_id.hex()
+            object.__setattr__(self, "_span_id_hex", text)
+        return text
 
     @property
     def sampled(self) -> bool:
@@ -235,6 +270,18 @@ def new_span_id() -> bytes:
     while (span_id := os.urandom(8)) == INVALID_SPAN_ID:
         pass
     return span_id
+
+
+def _new_root_ids() -> tuple[bytes, bytes]:
+    """A new ``(trace_id, span_id)`` pair from one :func:`os.urandom` call."""
+    raw = os.urandom(24)
+    trace_id = raw[:16]
+    span_id = raw[16:]
+    if trace_id == INVALID_TRACE_ID:
+        trace_id = new_trace_id()
+    if span_id == INVALID_SPAN_ID:
+        span_id = new_span_id()
+    return trace_id, span_id
 
 
 _SAMPLED = 0x01
@@ -453,6 +500,35 @@ class Span:
             self._ended = True
             self._live = False
             self._end_ns = self._now_ns() if end_time_ns is None else end_time_ns
+        self._hand_off()
+
+    def _finish(self, attrs: Mapping[str, AttrValue], code: StatusCode, message: str = "") -> None:
+        """``set_attrs(attrs)``, ``set_status(code, message)`` and ``end()`` in one step.
+
+        Private seam for operations and steps: the same semantics as the three
+        calls in a row (privacy-filtered attrs merged, later values winning; the
+        status replaced; idempotent end), but with one lock round trip.
+        """
+        cleaned: Mapping[str, AttrValue] | None = None
+        if self._live:
+            if attrs:
+                cleaned = self._clean(attrs)
+            if self._policy is not None and (message or type(message) is not str):
+                message = self._policy.message(message)
+        with self._lock:
+            if self._ended:
+                return
+            if self._live:
+                if cleaned:
+                    self._attrs.update(cleaned)
+                self._status = (code, message)
+            self._ended = True
+            self._live = False
+            self._end_ns = self._now_ns()
+        self._hand_off()
+
+    def _hand_off(self) -> None:
+        """Pass the ended span to the tracer's processor if it is sampled."""
         tracer = self._tracer
         if tracer is not None and self._context.trace_flags & _SAMPLED:
             processor = tracer._processor
@@ -562,15 +638,16 @@ class Tracer:
             trace_id = parent_ctx.trace_id
             trace_state = parent_ctx.trace_state
             parent_sampled = bool(parent_ctx.trace_flags & _SAMPLED)
+            span_id = new_span_id()
         else:
             parent_ctx = None
-            trace_id = new_trace_id()
+            trace_id, span_id = _new_root_ids()
             trace_state = _EMPTY_TRACE_STATE
             parent_sampled = None
         result = self._sampler.should_sample(trace_id, name, parent_sampled)
         if result.attrs:
             attrs = {**(attrs or {}), **result.attrs}
-        context = SpanContext(trace_id, new_span_id(), int(result.sampled), trace_state)
+        context = SpanContext._trusted(trace_id, span_id, int(result.sampled), trace_state)
         return Span(
             name,
             context,
@@ -605,7 +682,15 @@ def current_span() -> Span | None:
 
 
 def current_span_context() -> SpanContext | None:
-    """Return the innermost span's context, or ``None``."""
+    """Return the innermost span's context, or ``None``.
+
+    This sees spans only. :func:`pyrock.current_span_context` (used by
+    :func:`pyrock.inject_headers`) also falls back to the innermost
+    operation's context, so it still finds the remote parent or untraced
+    context of an operation running under ``no_trace``. Code that must
+    propagate through untraced operations should use the ``pyrock`` function
+    or pass ``span_context`` explicitly.
+    """
     span = _current_span.get()
     return None if span is None else span._context
 

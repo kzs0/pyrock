@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import enum
 import functools
-import inspect
 import itertools
 import math
 import re
@@ -199,6 +198,8 @@ class Timer:
 
     def __call__(self, fn: F, /) -> F:
         """Wrap ``fn`` so that every call (or every ``await`` of it) is timed."""
+        import inspect  # deferred: decorating is rare, and import time matters
+
         observe = self._observe
         if inspect.iscoroutinefunction(fn):
 

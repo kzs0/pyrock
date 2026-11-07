@@ -49,11 +49,15 @@ class HTTPPropagator:
     def inject(self, carrier: Any, span_context: SpanContext | None = None) -> None:
         """Write trace context into a ``MutableMapping[str, str]`` or a list of pairs.
 
-        Uses the current span's context when ``span_context`` is ``None``; does
-        nothing when there is no valid context. A mapping gets lowercase keys
-        (a stale ``tracestate`` is removed when there is none to send); a list
-        gets pairs appended, as ``bytes`` when the list already holds ``bytes``
-        names (ASGI style).
+        Uses the current span's context (:func:`pyrock.trace.current_span_context`)
+        when ``span_context`` is ``None``; does nothing when there is no valid
+        context. That lookup sees spans only, so inside an operation started
+        with ``no_trace`` nothing is injected; :func:`pyrock.inject_headers`
+        falls back to the operation's context and does propagate there.
+
+        A mapping gets lowercase keys (a stale ``tracestate`` is removed when
+        there is none to send); a list gets pairs appended, as ``bytes`` when
+        the list already holds ``bytes`` names (ASGI style).
         """
         context = current_span_context() if span_context is None else span_context
         if context is None or not context.is_valid:

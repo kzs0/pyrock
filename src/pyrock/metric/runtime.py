@@ -26,9 +26,10 @@ import sys
 import threading
 import time
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
+from pyrock._compat import gil_enabled
 from pyrock.metric import Counter, Gauge, Registry
 
 if TYPE_CHECKING:
@@ -206,12 +207,6 @@ def _python_version() -> str:
     return version
 
 
-def _gil_enabled() -> bool:
-    """True unless a free-threaded build runs with the GIL disabled (3.13+)."""
-    is_gil_enabled: Callable[[], bool] | None = getattr(sys, "_is_gil_enabled", None)
-    return True if is_gil_enabled is None else is_gil_enabled()
-
-
 class _GCPauseRecorder:
     """A ``gc.callbacks`` entry that buffers pause durations without taking locks.
 
@@ -327,7 +322,7 @@ class RuntimeCollector:
         labels = {
             "implementation": sys.implementation.name,
             "version": _python_version(),
-            "gil": "true" if _gil_enabled() else "false",
+            "gil": "true" if gil_enabled() else "false",
         }
         if labels != self._info_labels:  # the GIL can be re-enabled at runtime
             self._info._clear()
