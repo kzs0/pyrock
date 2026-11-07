@@ -9,6 +9,7 @@ the server or :mod:`asyncio`, not to track milliseconds.
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import subprocess
 import sys
@@ -31,8 +32,16 @@ DEFERRED = (
 
 
 def _run(code: str) -> str:
+    # Measure a clean interpreter: coverage's subprocess patch (COVERAGE_*)
+    # would otherwise start coverage in the child, which imports json & co.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("COVERAGE_")}
     out = subprocess.run(
-        [sys.executable, "-c", code], check=True, capture_output=True, text=True, timeout=60
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
     )
     return out.stdout.strip().splitlines()[-1]
 
