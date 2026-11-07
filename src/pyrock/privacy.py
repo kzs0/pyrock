@@ -39,7 +39,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final
 
-from pyrock._compat import is_nonempty_str, is_positive_int
+from pyrock._compat import MISSING_LABEL, is_nonempty_str, is_positive_int
 
 __all__ = [
     "ALIAS_MARKER",
@@ -83,8 +83,6 @@ def _key_tuple(value: Iterable[str] | None, name: str) -> tuple[str, ...] | None
 
 _TRUNCATED: Final = "[truncated]"
 _INVALID_URL: Final = "[invalid URL]"
-_MISSING_LABEL: Final = "_"
-"""Same value as ``pyrock.attr.MISSING_LABEL`` (this module may not import it)."""
 _MAX_DEPTH: Final = 32
 """Containers nested deeper than this become ``"[truncated]"``, which keeps
 every encoder's own recursion shallow."""
@@ -441,7 +439,7 @@ class Policy:
     def label_value(self, key: str, value: str, /) -> str:
         """Clean a metric label value; disallowed values become ``"_"``."""
         cleaned, keep = self.value(key, value)
-        return cleaned if keep and type(cleaned) is str else _MISSING_LABEL
+        return cleaned if keep and type(cleaned) is str else MISSING_LABEL
 
     def profile_labels(self, labels: Mapping[str, Any], /) -> dict[str, Any]:
         """Clean profile labels, raising ``ValueError`` above the size/depth limits.

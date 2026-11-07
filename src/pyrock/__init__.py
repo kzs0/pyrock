@@ -41,7 +41,10 @@ from pyrock._bedrock import (
     warn,
     warning,
 )
-from pyrock._context import ContextThreadPoolExecutor, Thread, bind
+from pyrock._context import Thread, bind
+from pyrock._operation import (
+    Activation as Activation,  # re-exported outside the __all__ contract
+)
 from pyrock._operation import (
     Operation,
     OperationScope,
@@ -57,11 +60,14 @@ from pyrock._operation import (
 from pyrock._version import __version__ as __version__
 from pyrock.attr import AttrValue, Event
 from pyrock.config import Config, ConfigError
+from pyrock.metric import MetricConflictError as MetricConflictError
+from pyrock.metric import MetricLimitError as MetricLimitError
 from pyrock.trace import SpanContext, SpanKind
 
 if TYPE_CHECKING:
     # Lazily loaded on first attribute access (see __getattr__ below).
     from pyrock._cloud import CloudConfig, cloud
+    from pyrock._context import ContextThreadPoolExecutor
 
 __all__ = [
     "AttrValue",
@@ -105,14 +111,14 @@ __all__ = [
     "warning",
 ]
 
-# name -> (module, attribute or None for the module itself)
+# name -> (module, attribute or None for the module itself). ``env`` and ``logs``
+# need no entry: the core imports them, which binds them as attributes.
 _LAZY: dict[str, tuple[str, str | None]] = {
     "CloudConfig": ("pyrock._cloud", "CloudConfig"),
+    "ContextThreadPoolExecutor": ("pyrock._context", "ContextThreadPoolExecutor"),
     "cloud": ("pyrock._cloud", "cloud"),
     "asgi": ("pyrock.asgi", None),
-    "env": ("pyrock.env", None),
     "http": ("pyrock.http", None),
-    "logs": ("pyrock.logs", None),
     "profile": ("pyrock.profile", None),
     "server": ("pyrock.server", None),
     "testing": ("pyrock.testing", None),

@@ -7,6 +7,10 @@ start with an empty context unless the interpreter inherits it
 (``sys.flags.thread_inherit_context``, the default on free-threaded 3.14), so
 pyrock provides explicit helpers: :func:`bind`, :class:`ContextThreadPoolExecutor`
 and :class:`Thread`.
+
+:class:`ContextThreadPoolExecutor` is defined on first access (module
+``__getattr__``) so that ``import pyrock`` does not load
+:mod:`concurrent.futures`.
 """
 
 from __future__ import annotations
@@ -15,10 +19,11 @@ import contextvars
 import functools
 import threading
 from collections.abc import Callable, Iterable, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, overload
 
 if TYPE_CHECKING:
+    from concurrent.futures import Future, ThreadPoolExecutor
+
     from pyrock._bedrock import Bedrock
     from pyrock._operation import Operation, Source, Step
 
@@ -89,21 +94,53 @@ def bind(fn: Callable[..., R], /, *args: Any, **kwargs: Any) -> Callable[..., R]
 
         return bound
 
+    @functools.wraps(fn)
     def partial(*call_args: Any, **call_kwargs: Any) -> R:
         return captured.copy().run(fn, *args, *call_args, **{**kwargs, **call_kwargs})
 
+    # The pre-bound arguments are no longer part of the signature.
+    del partial.__wrapped__
     return partial
 
 
-class ContextThreadPoolExecutor(ThreadPoolExecutor):
-    """A :class:`ThreadPoolExecutor` that copies the caller's context on every submit.
+_EXECUTOR_DOC = """A :class:`~concurrent.futures.ThreadPoolExecutor` that copies the caller's
+context on every submit.
 
-    :meth:`map` goes through :meth:`submit`, so it copies context too.
-    """
+:meth:`map` goes through :meth:`submit`, so it copies context too.
+"""
 
-    def submit(self, fn: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs) -> Future[R]:
-        run: Callable[..., R] = contextvars.copy_context().run
-        return super().submit(run, fn, *args, **kwargs)
+if TYPE_CHECKING:
+
+    class ContextThreadPoolExecutor(ThreadPoolExecutor):
+        def submit(self, fn: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs) -> Future[R]:
+            """Run ``fn(*args, **kwargs)`` in a copy of the caller's context."""
+            ...
+
+else:
+
+    def _define_executor() -> type:
+        from concurrent.futures import ThreadPoolExecutor
+
+        class ContextThreadPoolExecutor(ThreadPoolExecutor):
+            __doc__ = _EXECUTOR_DOC
+
+            def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+                """Run ``fn(*args, **kwargs)`` in a copy of the caller's context."""
+                return super().submit(contextvars.copy_context().run, fn, *args, **kwargs)
+
+        ContextThreadPoolExecutor.__qualname__ = "ContextThreadPoolExecutor"
+        return ContextThreadPoolExecutor
+
+    _define_lock = threading.Lock()
+
+    def __getattr__(name: str) -> Any:
+        if name != "ContextThreadPoolExecutor":
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        with _define_lock:  # define the class exactly once
+            cls = globals().get(name)
+            if cls is None:
+                cls = globals()[name] = _define_executor()
+        return cls
 
 
 class Thread(threading.Thread):

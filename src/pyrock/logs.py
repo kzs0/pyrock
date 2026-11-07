@@ -24,8 +24,8 @@ written.
 
 The top-level ``pyrock.log(level, msg, ...)`` helper lives in ``pyrock`` itself.
 
-Import rules: ``pyrock.logs`` imports only ``pyrock.attr``, ``pyrock.trace`` and
-``pyrock.privacy`` from pyrock.
+Import rules: ``pyrock.logs`` imports only ``pyrock.attr``, ``pyrock.trace``,
+``pyrock.privacy`` and the ``pyrock._compat`` utilities from pyrock.
 """
 
 from __future__ import annotations
@@ -33,15 +33,16 @@ from __future__ import annotations
 import abc
 import datetime
 import functools
-import json
 import logging
 import math
+import os
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final, TextIO
 
+from pyrock._compat import LOG_LEVEL_CHOICES, log_level_number
 from pyrock.attr import (
     ERROR_FINGERPRINT,
     ERROR_KEY,
@@ -52,7 +53,7 @@ from pyrock.attr import (
     _text_value,
     error,
 )
-from pyrock.privacy import Policy
+from pyrock.privacy import REDACTED_MARKER, Policy
 from pyrock.trace import SpanContext, current_span_context
 
 __all__ = [
@@ -84,8 +85,6 @@ _CANONICAL_KEY: Final = "pyrock_canonical"
 _TRACE_ID: Final = "trace_id"
 _SPAN_ID: Final = "span_id"
 
-_REDACTED: Final = "[redacted]"
-"""The marker :meth:`Policy.apply` substitutes for private values."""
 
 _STANDARD_RECORD_KEYS: Final = frozenset(logging.makeLogRecord({}).__dict__) | {
     "message",
@@ -106,14 +105,6 @@ _ERROR_NAMESPACES: Final = ("error", "exception")
 
 # -- levels -----------------------------------------------------------------
 
-_LEVEL_NAMES: Final = {
-    "debug": logging.DEBUG,
-    "info": logging.INFO,
-    "warn": logging.WARNING,
-    "warning": logging.WARNING,
-    "error": logging.ERROR,
-}
-
 _GO_LEVELS: Final = (
     (logging.CRITICAL, "CRITICAL"),
     (logging.ERROR, "ERROR"),
@@ -124,15 +115,16 @@ _GO_LEVELS: Final = (
 
 
 def parse_level(level: str | int, /) -> int:
-    """Map ``debug``/``info``/``warn``/``warning``/``error`` (any case) or an int to a level.
+    """Map a level name (``pyrock._compat.LOG_LEVELS``, any case) or an int to a level.
 
-    Raises ``ValueError`` for unknown names.
+    The names are ``debug``, ``info``, ``warn``, ``warning``, ``error`` and
+    ``critical``, the same set ``Config.log_level`` accepts. Raises
+    ``ValueError`` for anything else (``bool`` included).
     """
-    if isinstance(level, int) and not isinstance(level, bool):
-        return int(level)
-    if isinstance(level, str) and (number := _LEVEL_NAMES.get(level.lower())) is not None:
-        return number
-    raise ValueError(f"unknown log level {level!r}")
+    number = log_level_number(level)
+    if number is None:
+        raise ValueError(f"unknown log level {level!r}: expected one of {LOG_LEVEL_CHOICES}")
+    return number
 
 
 @functools.lru_cache(maxsize=64)
@@ -173,9 +165,14 @@ def _json_default(value: object) -> object:
     return None
 
 
-_encode: Final = json.JSONEncoder(
-    ensure_ascii=False, separators=(",", ":"), allow_nan=False, default=_json_default
-).encode
+@functools.cache
+def _encoder() -> Callable[[Any], str]:
+    """The compact JSON encoder, built on first use (keeps :mod:`json` out of ``import pyrock``)."""
+    import json
+
+    return json.JSONEncoder(
+        ensure_ascii=False, separators=(",", ":"), allow_nan=False, default=_json_default
+    ).encode
 
 
 def _finite(value: Any) -> Any:
@@ -192,9 +189,9 @@ def _finite(value: Any) -> Any:
 def _dumps(value: Any) -> str:
     """Compact JSON; the slower NaN-safe pass runs only when needed."""
     try:
-        return _encode(value)
+        return _encoder()(value)
     except ValueError:
-        return _encode(_finite(value))
+        return _encoder()(_finite(value))
 
 
 def _is_error_namespace(key: str) -> bool:
@@ -372,7 +369,7 @@ class _StructuredFormatter(logging.Formatter, abc.ABC):
         return {
             key: value
             for key, value in self._policy.apply(raw).items()
-            if not (value == _REDACTED and _is_error_namespace(key))
+            if not (value == REDACTED_MARKER and _is_error_namespace(key))
         }
 
     def _error(self, exc: BaseException) -> dict[str, Any]:
@@ -613,9 +610,24 @@ class _Installation:
         self._logger.propagate = saved.propagate
 
 
-_install_lock: Final = threading.Lock()
+_install_lock = threading.Lock()
 _installed: dict[logging.Logger, list[_Installation]] = {}
 """Live installs per logger, oldest first (guarded by ``_install_lock``)."""
+
+
+def _install_lock_after_fork_in_child() -> None:
+    """Replace the lock in a forked child: a holder thread at fork time no longer exists."""
+    global _install_lock
+    _install_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    # Held across fork() so the child never inherits a half-updated ``_installed``.
+    os.register_at_fork(
+        before=lambda: _install_lock.acquire(),
+        after_in_parent=lambda: _install_lock.release(),
+        after_in_child=_install_lock_after_fork_in_child,
+    )
 
 
 def _nothing() -> None:

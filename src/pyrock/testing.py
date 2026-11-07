@@ -14,25 +14,29 @@
 ``capture()`` needs no pytest plugin. When pytest is running, the
 ``pyrock_capture`` fixture is also available (registered through the
 ``pytest11`` entry point; this module never imports pytest).
+
+Loading this module as that plugin is cheap: everything beyond ``import
+pyrock`` (the Prometheus encoder, :mod:`json`) is imported when first used.
 """
 
 from __future__ import annotations
 
 import io
-import json
 import sys
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import TracebackType
-from typing import Any, overload
+from typing import TYPE_CHECKING, Any, overload
 
-from pyrock._bedrock import Bedrock
-from pyrock.attr import AttrValue
 from pyrock.config import Config
-from pyrock.metric import MetricType, Sample, sanitize_name
-from pyrock.metric import prometheus as _prometheus
-from pyrock.trace import Span, SpanEvent, SpanKind, SpanProcessor, StatusCode
+from pyrock.trace import StatusCode
+
+if TYPE_CHECKING:
+    from pyrock._bedrock import Bedrock
+    from pyrock.attr import AttrValue
+    from pyrock.metric import MetricType, Sample
+    from pyrock.trace import Span, SpanEvent, SpanKind, SpanProcessor
 
 __all__ = [
     "Capture",
@@ -208,6 +212,8 @@ class CapturedMetrics:
         anything. ``name_sum``/``name_count`` read a histogram's sum/count.
         ``None`` when no series matches. Works inside the block.
         """
+        from pyrock.metric import sanitize_name
+
         wanted = {sanitize_name(k): v for k, v in _filters(labels, kw).items()}
         registry = self._bedrock.metrics
         prefixed = f"{sanitize_name(registry.prefix)}_" if registry.prefix else ""
@@ -221,7 +227,9 @@ class CapturedMetrics:
 
     def text(self) -> str:
         """The Prometheus exposition text (also valid inside the ``with`` block)."""
-        return _prometheus.encode(self._bedrock.metrics).decode("utf-8")
+        from pyrock.metric import prometheus
+
+        return prometheus.encode(self._bedrock.metrics).decode("utf-8")
 
 
 def _sample_value(sample: Sample) -> float:
@@ -238,6 +246,8 @@ def _histogram_sum(sample: Sample) -> float:
 
 def _reader(family: str, kind: MetricType, names: set[str]) -> Callable[[Sample], float] | None:
     """How to read a sample of ``family`` when it answers one of ``names`` (else ``None``)."""
+    from pyrock.metric import MetricType
+
     if kind is not MetricType.HISTOGRAM:
         return _sample_value if family in names else None
     if family in names or f"{family}_count" in names:
@@ -253,6 +263,8 @@ class CapturedLogs(Sequence[dict[str, Any]]):
         self._lock = lock
 
     def _records(self) -> list[dict[str, Any]]:
+        import json
+
         with self._lock:
             text = self._stream.getvalue()
         records: list[dict[str, Any]] = []
@@ -322,6 +334,7 @@ class Capture:
         if self._entered:
             raise RuntimeError("a capture can be entered only once")
         self._entered = True
+        self.bedrock._install_logging()
         self.bedrock.__enter__()
         return self
 
@@ -349,15 +362,18 @@ def capture(
     ``log_output`` is given; spans never leave the process.
 
     Spans are complete once the block exits; ``metrics.text()`` and
-    ``metrics.value()`` work inside it. On exit the instance is shut down and
-    the previously active instance (if any) is restored, so nested captures
-    and ``with pyrock.init()`` blocks compose.
+    ``metrics.value()`` work inside it. Logging is installed when the block
+    is entered, not by ``capture()`` itself. On exit the instance is shut down
+    and the previously active instance (if any) is restored, so nested
+    captures and ``with pyrock.init()`` blocks compose.
     """
+    from pyrock._bedrock import Bedrock
+
     lock = threading.Lock()
     stream = _LockedStream(lock)
     settings = {**_CAPTURE_DEFAULTS, "log_output": stream, **overrides}
     base = Config.default() if config is None else config
-    bedrock = Bedrock(base, static_attrs=static_attrs, **settings)
+    bedrock = Bedrock(base, static_attrs=static_attrs, _defer_logging=True, **settings)
     exporter = InMemorySpanExporter()
     processor: SpanProcessor = _SynchronousProcessor(exporter)
     replaced = bedrock.tracer.processor

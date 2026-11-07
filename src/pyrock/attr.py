@@ -46,7 +46,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from types import TracebackType
 from typing import Any, TypeAlias
 
-from pyrock._compat import is_nonempty_str
+from pyrock._compat import MISSING_LABEL, is_nonempty_str
 
 __all__ = [
     "ERROR_CHAIN",
@@ -90,9 +90,6 @@ ERROR_CHAIN = "error.chain"
 ERROR_STACK = "error.stack"
 ERROR_GROUP_COUNT = "error.group.count"
 ERROR_TYPES = "error.types"
-
-MISSING_LABEL = "_"
-"""Value used for a declared metric label that was never registered."""
 
 
 class Event:

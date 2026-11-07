@@ -29,7 +29,10 @@ wrapper costs one ``ContextVar.get()`` plus a direct call. Only an explicit
 noop ``bedrock=`` makes the decorator return the function unchanged.
 Generators and async generators are instrumented for their whole iteration;
 their scope is made current only while their body runs, so the consumer's
-context is never changed between items.
+context is never changed between items. Like the generator body itself, the
+operation (its span and its clock) starts on the first ``next()`` /
+``asend()``, not when the generator object is created; a generator that is
+never iterated records nothing.
 
 Lifecycle of a live object: ``_start`` (create, span started, not current),
 ``_activate``/``_deactivate`` (make it current in this context and undo that)
@@ -41,21 +44,23 @@ This module is private; its public names are re-exported from ``pyrock``.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import functools
-import inspect
+import logging
 import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable, Generator, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType, TracebackType
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, cast
 
 from pyrock import logs
 from pyrock._context import bedrock_var, no_trace_var, operation_var, source_var, step_var
+from pyrock._noop import NOOP_COUNTER, NOOP_HISTOGRAM
 from pyrock.attr import ERROR_KEY, AttrValue, Event
-from pyrock.metric import Counter, Histogram
+from pyrock.metric import Counter, CounterChild, Gauge, Histogram, HistogramChild
 from pyrock.trace import (
     Span,
     SpanContext,
@@ -69,6 +74,7 @@ if TYPE_CHECKING:
     from pyrock._bedrock import Bedrock
 
 __all__ = [
+    "NOOP_OPERATION_METRICS",
     "Activation",
     "Operation",
     "OperationScope",
@@ -92,6 +98,8 @@ RegisterItem = Mapping[str, AttrValue] | Event | BaseException
 ExpectedExceptions = tuple[type[BaseException], ...]
 
 _Tokens = tuple[contextvars.Token[Any], ...]
+
+_logger = logging.getLogger(logs.LOGGER_NAME)
 
 
 class Activation:
@@ -170,6 +178,24 @@ def _hex(context: SpanContext | None, *, span_id: bool) -> str | None:
     return context.span_id_hex if span_id else context.trace_id_hex
 
 
+_Bound = tuple[CounterChild, CounterChild, CounterChild, HistogramChild]
+"""The count, successes, failures and duration series of one label-value set."""
+
+_BOUND_CACHE_LIMIT = 1024
+"""Label-value sets remembered per operation schema; beyond it, series are looked up."""
+
+_MISSING = object()
+
+
+def _value_key(value: object) -> object:
+    """A hashable key that keeps values apart when they render differently.
+
+    ``1``, ``1.0`` and ``True`` are equal (and hash alike) but become the
+    labels ``"1"``, ``"1.0"`` and ``"true"``, so non-strings carry their type.
+    """
+    return value if type(value) is str else (type(value), value)
+
+
 @dataclass(frozen=True, slots=True)
 class _OperationMetrics:
     """The four metric families of one operation schema (cached per instance)."""
@@ -180,14 +206,40 @@ class _OperationMetrics:
     successes: Counter
     failures: Counter
     duration: Histogram
+    _bound: dict[tuple[object, ...], _Bound] = field(default_factory=dict, compare=False)
+    """Label values as given -> bound series (bounded by :data:`_BOUND_CACHE_LIMIT`)."""
 
     def record(self, attrs: Mapping[str, AttrValue], success: bool, duration_ms: float) -> None:
-        values = {key: attrs[key] for key in self.labels if key in attrs}
-        self.count.labels(values).inc()
-        # Bind both outcomes so a label set always exposes its zero series too.
-        successes, failures = self.successes.labels(values), self.failures.labels(values)
+        try:
+            key = tuple([_value_key(attrs.get(k, _MISSING)) for k in self.labels])
+            bound = self._bound.get(key)
+        except TypeError:  # an unhashable value (a list): bind without caching
+            key, bound = None, None
+        if bound is None:
+            bound = self._bind(attrs)
+            cache = self._bound
+            if key is not None and len(cache) < _BOUND_CACHE_LIMIT:
+                cache[key] = bound
+        count, successes, failures, duration = bound
+        count.inc()
+        # Both outcomes are bound, so a label set always exposes its zero series too.
         (successes if success else failures).inc()
-        self.duration.labels(values).observe(duration_ms)
+        duration.observe(duration_ms)
+
+    def _bind(self, attrs: Mapping[str, AttrValue]) -> _Bound:
+        values = {key: attrs[key] for key in self.labels if key in attrs}
+        return (
+            self.count.labels(values),
+            self.successes.labels(values),
+            self.failures.labels(values),
+            self.duration.labels(values),
+        )
+
+
+NOOP_OPERATION_METRICS = _OperationMetrics(
+    (), NOOP_COUNTER, NOOP_COUNTER, NOOP_COUNTER, NOOP_HISTOGRAM
+)
+"""Shared by operations whose metric families could not be registered (logged once)."""
 
 
 # --------------------------------------------------------------------- operation
@@ -406,9 +458,7 @@ class Operation:
         duration_ms = (time.perf_counter_ns() - self._start_ns) / 1e6
         span = self._span
         if span is not None:
-            span.set_attrs(attrs)
-            span.set_status(StatusCode.ERROR if failed else StatusCode.OK)
-            span.end()
+            span._finish(attrs, StatusCode.ERROR if failed else StatusCode.OK)
         self._metrics.record(attrs, not failed, duration_ms)
         bedrock = self._bedrock
         if bedrock._canonical_logs:
@@ -529,10 +579,12 @@ class Step:
                 return
             self._ended = True
         span = self._span
-        if span is not None:
+        if span is None:
+            return
+        if self._failed:
+            span._finish(self._attrs, StatusCode.ERROR)
+        else:  # keep any status set on the span directly
             span.set_attrs(self._attrs)
-            if self._failed:
-                span.set_status(StatusCode.ERROR)
             span.end()
 
     def _merge(self, attrs: Mapping[str, AttrValue]) -> None:
@@ -580,10 +632,12 @@ class Source:
     __slots__ = (
         "_attrs",
         "_bedrock",
+        "_counters",
         "_enclosing",
+        "_gauges",
+        "_histograms",
         "_label_values",
         "_labels",
-        "_metrics",
         "_name",
         "_scope",
         "_tokens",
@@ -605,7 +659,10 @@ class Source:
         aggregate_labels = bedrock._metric_labels(metric_labels)
         self._label_values = {k: self._attrs[k] for k in aggregate_labels if k in self._attrs}
         self._enclosing: Operation | Step | None = step_var.get() or operation_var.get()
-        self._metrics: dict[tuple[str, str], Any] = {}
+        # Aggregates by short name, registered on first use (once per source).
+        self._counters: dict[str, Counter] = {}
+        self._gauges: dict[str, Gauge] = {}
+        self._histograms: dict[str, Histogram] = {}
         self._scope: SourceScope | None = None
         self._tokens = _NO_TOKENS
 
@@ -622,29 +679,36 @@ class Source:
         return self._labels
 
     def sum(self, name: str, value: float = 1.0, /) -> None:
-        """Add to the counter ``<source>_<name>`` (source labels + static labels)."""
-        self._metric("counter", name).labels(self._label_values).inc(value)
+        """Add to the counter ``<source>_<name>`` (source labels + static labels).
+
+        As for operations, a registration conflict (say ``<source>_<name>`` is
+        already a gauge) or the family limit is logged once and the value dropped.
+        """
+        metric = self._counters.get(name)
+        if metric is None:
+            metric = self._counters[name] = self._bedrock._source_counter(*self._schema(name))
+        metric.labels(self._label_values).inc(value)
 
     def gauge(self, name: str, value: float, /) -> None:
         """Set the gauge ``<source>_<name>``."""
-        self._metric("gauge", name).labels(self._label_values).set(value)
+        metric = self._gauges.get(name)
+        if metric is None:
+            metric = self._gauges[name] = self._bedrock._source_gauge(*self._schema(name))
+        metric.labels(self._label_values).set(value)
 
     def histogram(self, name: str, value: float, /) -> None:
         """Observe ``value`` in the histogram ``<source>_<name>``."""
-        self._metric("histogram", name).labels(self._label_values).observe(value)
+        metric = self._histograms.get(name)
+        if metric is None:
+            metric = self._histograms[name] = self._bedrock._source_histogram(*self._schema(name))
+        metric.labels(self._label_values).observe(value)
 
     def done(self) -> None:
         """Kept for symmetry with Go; leaving the scope restores the previous context."""
 
-    def _metric(self, kind: str, name: str) -> Any:
-        """The source aggregate ``kind`` named ``name`` (registered once per source)."""
-        key = (kind, name)
-        metric = self._metrics.get(key)
-        if metric is None:
-            metric = self._metrics[key] = self._bedrock._source_metric(
-                kind, f"{self._name}_{name}", f"Aggregated {name} for {self._name}", self._labels
-            )
-        return metric
+    def _schema(self, name: str) -> tuple[str, str, tuple[str, ...]]:
+        """``(full name, help, labels)`` of the aggregate ``name``."""
+        return f"{self._name}_{name}", f"Aggregated {name} for {self._name}", self._labels
 
     def _activate(self) -> _Tokens:
         tokens = _common_tokens(self._bedrock, None, False)
@@ -836,13 +900,17 @@ class _Scope(ABC, Generic[L]):
     only when an explicit noop ``bedrock=`` was given.
     """
 
-    __slots__ = ("_bedrock", "_disabled")
+    __slots__ = ("_bedrock", "_disabled", "_last")
 
     _var: ClassVar[contextvars.ContextVar[Any]]
+
+    _last: L | None
+    """The live object of the latest ``with`` entry not yet exited (for unbalanced exits)."""
 
     def __init__(self, bedrock: Bedrock | None) -> None:
         self._disabled = bedrock is not None and bedrock.is_noop
         self._bedrock = None if self._disabled else bedrock
+        self._last = None
 
     @abstractmethod
     def _noop(self) -> L:
@@ -853,10 +921,15 @@ class _Scope(ABC, Generic[L]):
         """Create the live object for one entry (not yet current)."""
 
     def _instance(self) -> Bedrock | None:
+        """The pinned instance, else the active one; a shut-down active one counts as none."""
         if self._disabled:
             return None
         bedrock = self._bedrock
-        return bedrock_var.get() if bedrock is None else bedrock
+        if bedrock is None:
+            bedrock = bedrock_var.get()
+            if bedrock is not None and bedrock._closed:
+                return None
+        return bedrock
 
     def _enter(self) -> L:
         bedrock = self._instance()
@@ -866,6 +939,7 @@ class _Scope(ABC, Generic[L]):
         if live is not self._noop():  # a step may still turn out to be a noop
             live._scope = self  # type: ignore[assignment]
             live._tokens = live._activate()
+            self._last = live
         return live
 
     def __enter__(self) -> L:
@@ -884,10 +958,38 @@ class _Scope(ABC, Generic[L]):
     ) -> None:
         live = self._var.get()
         if live is not None and live._scope is self:
+            if self._last is live:
+                self._last = None
             try:
                 live._close(exc)
             finally:
                 _restore(live._tokens)
+            return
+        entered = self._last
+        if entered is not None:
+            self._last = None
+            self._unbalanced_exit(entered, exc)
+
+    def _unbalanced_exit(self, entered: L, exc: BaseException | None) -> None:
+        """Close what this scope entered although it is no longer the innermost scope.
+
+        Something activated inside the block was never deactivated (or the
+        block exited in another context). Warn, end the object anyway and undo
+        its activation where this context allows.
+        """
+        _logger.warning(
+            "pyrock: %r exited while it was not the innermost %s (unbalanced activate/"
+            "deactivate, or exited in another context); ending it anyway",
+            entered,
+            type(entered).__name__.lower(),
+        )
+        try:
+            entered._close(exc)
+        finally:
+            for token in reversed(entered._tokens):
+                # RuntimeError: used already; ValueError: created in another context.
+                with contextlib.suppress(RuntimeError, ValueError):
+                    token.var.reset(token)
 
     async def __aexit__(
         self,
@@ -900,8 +1002,16 @@ class _Scope(ABC, Generic[L]):
     # -- decorating ------------------------------------------------------------
 
     def __call__(self, fn: F, /) -> F:
+        """Decorate ``fn`` (function, coroutine function, generator or async generator).
+
+        A generator's (or async generator's) operation starts on its first
+        ``next()``/``asend()`` and ends when it is exhausted, closed or raises;
+        creating the generator object records nothing.
+        """
         if self._disabled:
             return fn
+        import inspect  # deferred: decorating is rare, ``import pyrock`` is not
+
         if inspect.isasyncgenfunction(fn):
             wrapper: Callable[..., Any] = self._wrap_async_generator(fn)
         elif inspect.isgeneratorfunction(fn):
@@ -1070,6 +1180,7 @@ class OperationScope(_Scope[Operation]):
         if bedrock is None:  # the common case, inlined from _Scope.__init__
             self._bedrock = None
             self._disabled = False
+            self._last = None
         else:
             _Scope.__init__(self, bedrock)
         self._name = name
@@ -1208,6 +1319,8 @@ def start_operation(
     """Start an operation now without activating it (manual lifecycle; call ``end()``)."""
     if bedrock is None:
         bedrock = bedrock_var.get()
+        if bedrock is not None and bedrock._closed:  # a shut-down active instance
+            return NOOP_OPERATION
     if bedrock is None or bedrock.is_noop:
         return NOOP_OPERATION
     return Operation(

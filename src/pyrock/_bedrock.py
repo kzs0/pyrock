@@ -41,9 +41,11 @@ from types import MappingProxyType, TracebackType
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from pyrock import logs
+from pyrock._compat import ConfigError
 from pyrock._context import bedrock_var, operation_var, step_var
 from pyrock._noop import NOOP_COUNTER, NOOP_GAUGE, NOOP_HISTOGRAM
 from pyrock._operation import (
+    NOOP_OPERATION_METRICS,
     Operation,
     OperationScope,
     RegisterItem,
@@ -56,7 +58,16 @@ from pyrock._operation import (
 from pyrock.attr import AttrValue
 from pyrock.attr import error as error_attrs
 from pyrock.config import Config
-from pyrock.metric import Counter, Gauge, Histogram, Registry, sanitize_name
+from pyrock.metric import (
+    Counter,
+    Gauge,
+    Histogram,
+    MetricConflictError,
+    MetricLimitError,
+    MetricType,
+    Registry,
+    sanitize_name,
+)
 from pyrock.privacy import Policy
 from pyrock.trace import (
     Span,
@@ -65,8 +76,6 @@ from pyrock.trace import (
     Tracer,
 )
 from pyrock.trace import current_span as _current_span
-from pyrock.trace.http import HTTPPropagator
-from pyrock.trace.otlp.batch import BatchProcessor, BatchStats
 from pyrock.trace.sampler import AlwaysOn, ParentBased, Ratio, Sampler
 
 if TYPE_CHECKING:
@@ -76,6 +85,8 @@ if TYPE_CHECKING:
     from pyrock.metric.runtime import RuntimeCollector
     from pyrock.profile import ProfileExportConfig, ProfileExporter, ProfileExportStats
     from pyrock.server import Server
+    from pyrock.trace.http import HTTPPropagator
+    from pyrock.trace.otlp.batch import BatchProcessor, BatchStats
 
 __all__ = [
     "Bedrock",
@@ -110,7 +121,11 @@ _UNLABELLED_PREFIXES = ("host.", "process.", "container.", "k8s.", "cloud.")
 _HELPER_STACKLEVEL = 3
 """``stacklevel`` that attributes helper log records to the helper's caller."""
 
-_PROPAGATOR = HTTPPropagator()
+_propagator: HTTPPropagator | None = None
+"""Built on first :func:`inject_headers` (keeps ``trace.http`` out of ``import pyrock``)."""
+
+_METRIC_ERRORS = (MetricConflictError, MetricLimitError)
+"""Registration errors that operations and sources log instead of raising."""
 
 _CONFIG_FIELDS = frozenset(f.name for f in dataclasses.fields(Config))
 
@@ -138,6 +153,40 @@ def _uses_grpc(config: Config) -> bool:
         return config.trace_protocol == "grpc"
     url = config.trace_url or ""
     return "://" not in url and "/" not in url
+
+
+def _nothing() -> None:
+    """The logging restore callback before logging is installed."""
+
+
+def _metric_static_labels(static: Mapping[str, AttrValue], policy: Policy) -> dict[str, AttrValue]:
+    """The static attrs that become constant metric labels (after the policy)."""
+    return {
+        key: value
+        for key, value in policy.resource(static).items()
+        if not key.startswith(_UNLABELLED_PREFIXES)
+    }
+
+
+def _static_problems(static: Mapping[str, AttrValue], labels: Iterable[str]) -> list[str]:
+    """Problems with static attr keys, as ``ConfigError`` lines (never echoing values)."""
+    keys: Iterable[object] = static  # callers may not respect the static type
+    problems = [
+        f"static_attrs keys must be non-empty strings, got {key!r}"
+        for key in keys
+        if not isinstance(key, str) or not key
+    ]
+    if problems:
+        return problems
+    for key in labels:
+        label = sanitize_name(key)
+        if not label or label[0].isdigit() or ":" in label:
+            problems.append(f"static attr {key!r} is not a valid metric label name")
+        elif label.startswith("__"):
+            problems.append(f"static attr {key!r} is a reserved metric label name (leading '__')")
+        elif label == "le":
+            problems.append(f"static attr {key!r} is reserved: histograms use the 'le' label")
+    return problems
 
 
 def _after_fork_hook(target: object) -> None:
@@ -170,26 +219,37 @@ class Bedrock:
         *,
         static_attrs: Mapping[str, AttrValue] | None = None,
         cloud: CloudConfig | None = None,
+        _defer_logging: bool = False,
         **overrides: Any,
     ) -> None:
         """``overrides`` are ``Config`` fields applied on top of ``config or Config.from_env()``.
 
         Unknown names raise ``TypeError``; invalid values raise ``ConfigError``.
+        ``_defer_logging`` (private, for ``testing.capture``) leaves the log
+        installation to a later :meth:`_install_logging` call.
         """
         config = _resolve_config(config, overrides)
         self._config = config
         self._policy = config.data_policy if config.data_policy is not None else Policy()
         self._canonical_logs = config.log_canonical
         self._lock = threading.Lock()
-        """Guards the lifecycle (``_closed``, profile exporters); held during shutdown."""
+        """Guards the lifecycle state (``_closed``, profile exporters); never held for I/O."""
         self._closed = False
+        self._shutdown_done = threading.Event()
+        """Set once the first :meth:`shutdown` has finished; concurrent callers wait on it."""
         self._activation: contextvars.Token[Bedrock | None] | None = None
         self._op_metrics: dict[tuple[str, tuple[str, ...]], _OperationMetrics] = {}
+        self._metric_warned: set[str] = set()
+        """Names whose metric registration failure was already logged."""
         self._loops: weakref.WeakSet[asyncio.AbstractEventLoop] = weakref.WeakSet()
         self._server: Server | None = None
         self._cloud: CloudWiring | None = None
         self._profilers: list[tuple[ProfileExportConfig, ProfileExporter]] = []
         self._restart_in_child: list[ProfileExportConfig] = []
+        self._runtime: RuntimeCollector | None = None
+        self._batch: BatchProcessor | None = None
+        self._restore_logging: Callable[[], None] = _nothing
+        self._logger = logging.getLogger(logs.LOGGER_NAME)
 
         detected: Mapping[str, AttrValue] = {}
         if not config.disable_environment_detection:
@@ -198,41 +258,34 @@ class Bedrock:
             detected = _envdetect.detect().attrs
         self._static: dict[str, AttrValue] = {**detected, **(static_attrs or {})}
 
-        self._registry = Registry(
-            config.metric_prefix,
-            buckets=config.metric_buckets,
-            const_labels={
-                key: value
-                for key, value in self._policy.resource(self._static).items()
-                if not key.startswith(_UNLABELLED_PREFIXES)
-            },
-            series_limit=config.metric_series_limit,
-            family_limit=config.metric_family_limit,
-            label_filter=self._policy.label_value,
-        )
-        self._runtime: RuntimeCollector | None = None
-        if config.runtime_metrics:
-            from pyrock.metric.runtime import RuntimeCollector
-
-            self._runtime = RuntimeCollector(self._registry)
-
+        # Everything up to the tracer holds no resources: validate and fail fast.
+        const_labels = _metric_static_labels(self._static, self._policy)
+        problems = _static_problems(self._static, const_labels)
+        if problems:
+            raise ConfigError(problems)
+        try:
+            self._registry = Registry(
+                config.metric_prefix,
+                buckets=config.metric_buckets,
+                const_labels=const_labels,
+                series_limit=config.metric_series_limit,
+                family_limit=config.metric_family_limit,
+                label_filter=self._policy.label_value,
+            )
+        except ValueError as exc:
+            raise ConfigError([f"static_attrs: {exc}"]) from None
         self._sampler = _sampler(config)
         self._tracer = self._new_tracer()
-        self._batch = self._new_batch_processor()
-        self._tracer.set_processor(self._batch)
 
-        self._logger = logging.getLogger(logs.LOGGER_NAME)
-        self._restore_logging = logs._install(
-            config.log_install,
-            level=logs.parse_level(config.log_level),
-            log_format=config.log_format,
-            stream=config.log_output,
-            service=config.service,
-            static_attrs=self._static,
-            policy=self._policy,
-            add_source=config.log_add_source,
-        )
         try:
+            if config.runtime_metrics:
+                from pyrock.metric.runtime import RuntimeCollector
+
+                self._runtime = RuntimeCollector(self._registry)
+            self._batch = self._new_batch_processor()
+            self._tracer.set_processor(self._batch)
+            if not _defer_logging:
+                self._install_logging()
             if config.server_enabled:
                 self._start_server()
             if config.profiles is not None:
@@ -249,6 +302,23 @@ class Bedrock:
 
     # -- construction helpers ------------------------------------------------
 
+    def _install_logging(self) -> None:
+        """Install logging per ``config.log_install`` (once; undone by :meth:`shutdown`)."""
+        config = self._config
+        with self._lock:
+            if self._closed or self._restore_logging is not _nothing:
+                return
+            self._restore_logging = logs._install(
+                config.log_install,
+                level=logs.parse_level(config.log_level),
+                log_format=config.log_format,
+                stream=config.log_output,
+                service=config.service,
+                static_attrs=self._static,
+                policy=self._policy,
+                add_source=config.log_add_source,
+            )
+
     def _new_tracer(self) -> Tracer:
         return Tracer(
             service=self._config.service,
@@ -263,13 +333,20 @@ class Bedrock:
         url = config.trace_url
         if not url:
             return None
+        from pyrock.trace.otlp.batch import BatchProcessor
+
         resource = self._tracer.resource
         if _uses_grpc(config):
-            from pyrock.trace.otlp.grpc import GRPCExporter
+            from pyrock.trace.otlp import grpc
 
+            try:
+                # One parser for every gRPC target: ``http://`` (or trace_insecure) is h2c.
+                _, _, plaintext = grpc.parse_target(url, insecure=config.trace_insecure)
+            except ValueError as exc:
+                raise ConfigError([f"trace_url: {exc}"]) from None
             return BatchProcessor(
-                GRPCExporter(
-                    url, service=config.service, resource=resource, insecure=config.trace_insecure
+                grpc.GRPCExporter(
+                    url, service=config.service, resource=resource, insecure=plaintext
                 )
             )
         from pyrock.trace.otlp.http import HTTPExporter
@@ -361,6 +438,8 @@ class Bedrock:
 
     def trace_export_stats(self) -> BatchStats:
         """Counters of the active batch processor (all zero without one)."""
+        from pyrock.trace.otlp.batch import BatchProcessor, BatchStats
+
         processor = self._tracer.processor
         return processor.stats() if isinstance(processor, BatchProcessor) else BatchStats()
 
@@ -401,36 +480,71 @@ class Bedrock:
         return tuple(key for key in labels if sanitize_name(key) not in static)
 
     def _operation_metrics(self, name: str, labels: tuple[str, ...]) -> _OperationMetrics:
-        """The four families of operation ``name`` (registered once per schema)."""
+        """The four families of operation ``name`` (registered once per schema).
+
+        Registration never fails the operation: a schema conflict (the same
+        name with other ``metric_labels``) or the family limit is logged once
+        per name, and the operation records into shared no-op metrics.
+        """
         key = (name, labels)
         cached = self._op_metrics.get(key)
         if cached is not None:
             return cached
         declared = self._metric_labels(labels)
         reg = self._registry
-        metrics = _OperationMetrics(
-            declared,
-            reg.counter(f"{name}_count", f"Total count of {name} operations", labels=declared),
-            reg.counter(f"{name}_successes", f"Successful {name} operations", labels=declared),
-            reg.counter(f"{name}_failures", f"Failed {name} operations", labels=declared),
-            reg.histogram(
-                f"{name}_duration_ms",
-                f"Duration of {name} operations in milliseconds",
-                labels=declared,
-            ),
-        )
+        try:
+            metrics = _OperationMetrics(
+                declared,
+                reg.counter(f"{name}_count", f"Total count of {name} operations", labels=declared),
+                reg.counter(f"{name}_successes", f"Successful {name} operations", labels=declared),
+                reg.counter(f"{name}_failures", f"Failed {name} operations", labels=declared),
+                reg.histogram(
+                    f"{name}_duration_ms",
+                    f"Duration of {name} operations in milliseconds",
+                    labels=declared,
+                ),
+            )
+        except _METRIC_ERRORS as exc:
+            self._metric_failed(name, exc)
+            metrics = NOOP_OPERATION_METRICS
         # A concurrent first use may register twice; the registry returns the same families.
         return self._op_metrics.setdefault(key, metrics)
 
+    def _source_counter(self, name: str, help: str, labels: Iterable[str]) -> Counter:
+        metric = self._source_metric(MetricType.COUNTER, name, help, labels)
+        return metric if isinstance(metric, Counter) else NOOP_COUNTER
+
+    def _source_gauge(self, name: str, help: str, labels: Iterable[str]) -> Gauge:
+        metric = self._source_metric(MetricType.GAUGE, name, help, labels)
+        return metric if isinstance(metric, Gauge) else NOOP_GAUGE
+
+    def _source_histogram(self, name: str, help: str, labels: Iterable[str]) -> Histogram:
+        metric = self._source_metric(MetricType.HISTOGRAM, name, help, labels)
+        return metric if isinstance(metric, Histogram) else NOOP_HISTOGRAM
+
     def _source_metric(
-        self, kind: str, name: str, help: str, labels: Iterable[str]
-    ) -> Counter | Gauge | Histogram:
+        self, kind: MetricType, name: str, help: str, labels: Iterable[str]
+    ) -> Counter | Gauge | Histogram | None:
+        """Register a source aggregate; ``None`` (logged once) if registration fails."""
         declared = self._metric_labels(labels)
-        if kind == "counter":
-            return self._registry.counter(name, help, labels=declared)
-        if kind == "gauge":
-            return self._registry.gauge(name, help, labels=declared)
-        return self._registry.histogram(name, help, labels=declared)
+        reg = self._registry
+        try:
+            if kind is MetricType.COUNTER:
+                return reg.counter(name, help, labels=declared)
+            if kind is MetricType.GAUGE:
+                return reg.gauge(name, help, labels=declared)
+            return reg.histogram(name, help, labels=declared)
+        except _METRIC_ERRORS as exc:
+            self._metric_failed(name, exc)
+            return None
+
+    def _metric_failed(self, name: str, exc: Exception) -> None:
+        """Warn once per ``name`` that its metrics are not recorded."""
+        with self._lock:
+            if name in self._metric_warned:
+                return
+            self._metric_warned.add(name)
+        self._logger.warning("pyrock: metrics for %r are not recorded: %s", name, exc, stacklevel=2)
 
     def _error_attrs(self, exc: BaseException) -> dict[str, AttrValue]:
         """``error.*`` attrs for ``exc`` with the policy's detail flags."""
@@ -453,7 +567,8 @@ class Bedrock:
         exc: BaseException | None = None
         for item in items:
             if isinstance(item, BaseException):
-                exc = exc or item
+                if exc is None:
+                    exc = item
             else:
                 fields.update(item)
         fields.update(attrs)
@@ -478,9 +593,11 @@ class Bedrock:
     def shutdown(self, *, timeout: float | None = None) -> None:
         """Flush spans, final metrics push, stop profiles and server, restore logging.
 
-        Idempotent and thread-safe: concurrent callers wait for the first to
-        finish. ``timeout`` (default ``config.shutdown_timeout``) bounds the
-        whole shutdown.
+        Idempotent and thread-safe: concurrent callers wait (within their own
+        ``timeout``) for the first to finish. ``timeout`` (default
+        ``config.shutdown_timeout``) bounds the whole shutdown. The lifecycle
+        lock is held only to take a snapshot, never while stopping components,
+        so :meth:`profile_stats` and friends stay responsive meanwhile.
         """
         budget = self._config.shutdown_timeout if timeout is None else timeout
         deadline = time.monotonic() + budget
@@ -489,17 +606,23 @@ class Bedrock:
             return max(0.0, deadline - time.monotonic())
 
         with self._lock:
-            if self._closed:
-                return
+            first = not self._closed
             self._closed = True
+            done = self._shutdown_done
             server, self._server = self._server, None
+            cloud = self._cloud
+            profilers = list(self._profilers)
+        if not first:
+            done.wait(remaining())
+            return
+        try:
             # Each stopper takes ``timeout=``; together they share one deadline.
             stoppers: list[tuple[str, Callable[..., object]]] = []
             if server is not None:
                 stoppers.append(("server", server.shutdown))
-            if self._cloud is not None:
-                stoppers.append(("cloud", self._cloud.stop))
-            stoppers.extend(("profiles", exporter.stop) for _, exporter in self._profilers)
+            if cloud is not None:
+                stoppers.append(("cloud", cloud.stop))
+            stoppers.extend(("profiles", exporter.stop) for _, exporter in profilers)
             stoppers.append(("traces", self._tracer.shutdown))
             for name, stop in stoppers:
                 try:
@@ -509,8 +632,11 @@ class Bedrock:
             if self._runtime is not None:
                 self._runtime.close()
             self._restore_logging()
-        with _instances_lock:
-            _instances.discard(self)
+        finally:
+            _atexit_instances.discard(self)
+            with _instances_lock:
+                _instances.discard(self)
+            done.set()
 
     async def ashutdown(self, *, timeout: float | None = None) -> None:
         """:meth:`shutdown` run off the event loop (``asyncio.to_thread``)."""
@@ -570,6 +696,8 @@ class Bedrock:
 
     def _after_fork_in_child(self) -> None:
         self._lock = threading.Lock()
+        if not self._shutdown_done.is_set():  # its waiters' lock may be held
+            self._shutdown_done = threading.Event()
         if self._closed:
             return
         self._server = None  # the parent owns the port; never serve from the child
@@ -584,6 +712,7 @@ class Bedrock:
             _after_fork_hook(processor)
         self._tracer.set_processor(processor)
         self._registry.reset()
+        self._metric_warned = set()
         if self._cloud is not None:
             _after_fork_hook(self._cloud)
         self._profilers = [(cfg, self._start_profiler(cfg)) for cfg in self._restart_in_child]
@@ -716,6 +845,7 @@ class _NoopBedrock(Bedrock):
         self._policy = Policy()
         self._static = {}
         self._closed = False
+        self._shutdown_done = threading.Event()
         self._activation = None
         self._registry = Registry()
         self._tracer = Tracer(service=self._config.service, policy=self._policy)
@@ -730,6 +860,8 @@ class _NoopBedrock(Bedrock):
         return None
 
     def trace_export_stats(self) -> BatchStats:
+        from pyrock.trace.otlp.batch import BatchStats
+
         return BatchStats()
 
     def profile_stats(self) -> ProfileExportStats:
@@ -813,11 +945,14 @@ def _fork_after_in_parent() -> None:
 
 def _fork_after_in_child() -> None:
     try:
+        # Profiling state first: restarted profile exporters must see fresh locks.
+        profile = sys.modules.get("pyrock.profile")  # never import profiling for a fork
+        reset = getattr(profile, "_after_fork_in_child", None)
+        if callable(reset):
+            reset()
+        _atexit_instances._after_fork_in_child()
         for bedrock in list(_instances):
             bedrock._after_fork_in_child()
-        locks = sys.modules.get("pyrock.profile._locks")
-        if locks is not None:  # never import profiling just because of a fork
-            locks.reset()
     finally:
         _instances_lock.release()
 
@@ -828,6 +963,47 @@ if hasattr(os, "register_at_fork"):
         after_in_parent=_fork_after_in_parent,
         after_in_child=_fork_after_in_child,
     )
+
+
+# ----------------------------------------------------------------------- atexit
+
+
+class _AtExit:
+    """Instances built with ``shutdown_atexit=True`` that are not shut down yet.
+
+    One process-wide ``atexit`` hook serves them all. Shutting an instance
+    down removes it, so nothing stays registered for it (or keeps it alive).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._instances: dict[int, Bedrock] = {}
+        self._registered = False
+
+    def add(self, bedrock: Bedrock) -> None:
+        with self._lock:
+            if not self._registered:
+                import atexit
+
+                atexit.register(self._run)
+                self._registered = True
+            self._instances[id(bedrock)] = bedrock
+
+    def discard(self, bedrock: Bedrock) -> None:
+        with self._lock:
+            self._instances.pop(id(bedrock), None)
+
+    def _after_fork_in_child(self) -> None:
+        self._lock = threading.Lock()
+
+    def _run(self) -> None:
+        with self._lock:
+            pending = list(self._instances.values())
+        for bedrock in pending:
+            bedrock.shutdown()
+
+
+_atexit_instances = _AtExit()
 
 
 # ----------------------------------------------------------------- module API
@@ -864,16 +1040,18 @@ def init(
     if activate:
         bedrock._activation = bedrock.activate()
     if shutdown_atexit:
-        import atexit
-
-        atexit.register(bedrock.shutdown)
+        _atexit_instances.add(bedrock)
     return bedrock
 
 
 def current() -> Bedrock:
-    """Return the active ``Bedrock``, or the noop singleton."""
+    """Return the active ``Bedrock``, or the noop singleton.
+
+    An active instance that has been shut down counts as inactive: after
+    ``b.shutdown()`` without ``with``, everything behaves as before ``init()``.
+    """
     bedrock = bedrock_var.get()
-    return _NOOP if bedrock is None else bedrock
+    return _NOOP if bedrock is None or bedrock._closed else bedrock
 
 
 def current_operation() -> Operation | None:
@@ -952,9 +1130,15 @@ def inject_headers(headers: H, /, span_context: SpanContext | None = None) -> H:
     Uses :func:`current_span_context` unless ``span_context`` is given; with
     neither, ``headers`` is returned unchanged.
     """
+    global _propagator
     context = current_span_context() if span_context is None else span_context
     if context is not None:
-        _PROPAGATOR.inject(headers, context)
+        propagator = _propagator
+        if propagator is None:
+            from pyrock.trace.http import HTTPPropagator
+
+            propagator = _propagator = HTTPPropagator()
+        propagator.inject(headers, context)
     return headers
 
 

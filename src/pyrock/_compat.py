@@ -7,19 +7,60 @@ behind feature detection here, so the rest of the package stays valid on 3.11.
 from __future__ import annotations
 
 import sys
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Iterable, Mapping
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, TypeVar, overload
+
+if TYPE_CHECKING:
+    import datetime
 
 __all__ = [
+    "LOG_LEVELS",
+    "LOG_LEVEL_CHOICES",
+    "MISSING_LABEL",
     "ConfigError",
     "gil_enabled",
-    "is_free_threaded_build",
     "is_nonempty_str",
     "is_number",
     "is_positive_int",
     "is_positive_number",
+    "log_level_number",
     "seconds",
 ]
+
+T = TypeVar("T")
+
+MISSING_LABEL: Final = "_"
+"""Label value of a declared metric label with no value (shared by ``attr`` and ``privacy``)."""
+
+LOG_LEVELS: Mapping[str, int] = MappingProxyType(
+    {
+        "debug": 10,
+        "info": 20,
+        "warn": 30,
+        "warning": 30,
+        "error": 40,
+        "critical": 50,
+    }
+)
+"""Accepted level names (lowercase; matched case-insensitively) -> :mod:`logging` levels.
+
+The one level table used by both ``Config.log_level`` validation and
+``logs.parse_level``. The numbers equal ``logging.DEBUG`` ... ``logging.CRITICAL``;
+they are spelled out so this module need not import :mod:`logging`.
+"""
+
+LOG_LEVEL_CHOICES = ", ".join(LOG_LEVELS)
+"""The accepted names, for problem messages."""
+
+
+def log_level_number(level: object) -> int | None:
+    """The numeric level for a :data:`LOG_LEVELS` name (any case) or an ``int``; else ``None``."""
+    if isinstance(level, int) and not isinstance(level, bool):
+        return level
+    if isinstance(level, str):
+        return LOG_LEVELS.get(level.lower())
+    return None
 
 
 class ConfigError(ValueError):
@@ -45,19 +86,20 @@ def gil_enabled() -> bool:
     return bool(check())
 
 
-def is_free_threaded_build() -> bool:
-    """Return whether this interpreter was built with ``--disable-gil``."""
-    import sysconfig
-
-    return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
-
-
 # -- small validation helpers shared by the config dataclasses -------------
 # They take ``object`` on purpose: they validate values whose static type a
 # caller may not have respected.
 
 
-def seconds(value: object) -> Any:
+@overload
+def seconds(value: datetime.timedelta) -> float: ...
+
+
+@overload
+def seconds(value: T) -> T: ...
+
+
+def seconds(value: object) -> object:
     """Normalize a :class:`datetime.timedelta` to float seconds; return others unchanged."""
     import datetime
 

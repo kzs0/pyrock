@@ -48,6 +48,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TextIO
 
 from pyrock._compat import (
+    LOG_LEVEL_CHOICES,
+    LOG_LEVELS,
     ConfigError,
     is_nonempty_str,
     is_number,
@@ -98,7 +100,6 @@ ENV_VARS: Mapping[str, str] = {
 }
 """Config field -> environment variable."""
 
-_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARN", "WARNING", "ERROR", "CRITICAL"})
 _DURATION_FIELDS = (
     "server_read_timeout",
     "server_read_header_timeout",
@@ -218,8 +219,8 @@ class Config:
         if not (is_number(self.trace_sample_rate) and 0.0 <= self.trace_sample_rate <= 1.0):
             out.append("trace_sample_rate must be within [0, 1]")
         level: object = self.log_level
-        if not (isinstance(level, str) and level.upper() in _LOG_LEVELS):
-            out.append("log_level must be one of debug, info, warn, error")
+        if not (isinstance(level, str) and level.lower() in LOG_LEVELS):
+            out.append(f"log_level must be one of {LOG_LEVEL_CHOICES} (any case)")
         if self.log_format not in ("json", "text"):
             out.append("log_format must be 'json' or 'text'")
         if self.log_install not in ("root", "pyrock", "none"):
@@ -232,12 +233,7 @@ class Config:
                 out.append("metric_buckets must be finite numbers")
             elif any(b >= c for b, c in itertools.pairwise(buckets)):
                 out.append("metric_buckets must be strictly increasing")
-        for name in (
-            "metric_series_limit",
-            "metric_family_limit",
-            "server_max_header_bytes",
-            "server_max_connections",
-        ):
+        for name in _INT_FIELDS:
             if not is_positive_int(getattr(self, name)):
                 out.append(f"{name} must be a positive integer")
         for name in _DURATION_FIELDS:
@@ -248,6 +244,30 @@ class Config:
         policy: object = self.data_policy
         if policy is not None and not isinstance(policy, Policy):
             out.append("data_policy must be a pyrock.privacy.Policy")
+        out.extend(self._object_problems())
+        return out
+
+    def _object_problems(self) -> list[str]:
+        """Type checks for the object-valued fields (their modules load only when set)."""
+        out: list[str] = []
+        output: object = self.log_output
+        if output is not None and not callable(getattr(output, "write", None)):
+            out.append("log_output must be a text stream (an object with write())")
+        handler: object = self.server_profile_handler
+        if handler is not None and not callable(handler):
+            out.append("server_profile_handler must be a WSGI application (a callable)")
+        sampler: object = self.trace_sampler
+        if sampler is not None:
+            from pyrock.trace.sampler import Sampler
+
+            if not isinstance(sampler, Sampler):
+                out.append("trace_sampler must be a pyrock.trace.sampler.Sampler")
+        profiles: object = self.profiles
+        if profiles is not None:
+            from pyrock.profile import ProfileExportConfig
+
+            if not isinstance(profiles, ProfileExportConfig):
+                out.append("profiles must be a pyrock.profile.ProfileExportConfig")
         return out
 
     @classmethod

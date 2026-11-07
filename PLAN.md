@@ -564,3 +564,23 @@ Agreed cross-package interfaces:
   `_bedrock` uses it.
 - **Level table:** `_compat.LOG_LEVELS` (WP-1) maps lowercase names to ints,
   `critical` included. Both `config` and `logs` use it.
+
+### Review-fix decisions
+
+37. **`Config.log_level` takes level names only**, so finding P2-15 is not
+    done. Ints remain accepted by the log helpers. The existing contract test
+    is kept.
+38. **`/debug/pprof` without a trailing slash stays 404**, as the contract
+    test requires. Finding P3-8 is not done.
+39. **`Activation`, `MetricConflictError` and `MetricLimitError`** can be
+    imported from `pyrock` but are not part of `__all__`. That keeps the
+    pinned public contract unchanged.
+40. **The pytest plugin still imports the core, about 40 ms per session.**
+    Avoiding that would need an entry point outside the package. This is
+    deferred.
+41. **Recorded deviations:**
+    - There is no pyright gate and no separate `bench/` project. The CI 3.14t
+      stress job and the unit perf tests stand in for them.
+    - A small, irreducible part of the import cost remains, about 18 ms from
+      stdlib `logging` and `dataclasses`. `import pyrock` is now about 41 ms,
+      against the 15 ms in DESIGN.
