@@ -5,18 +5,21 @@
     pyrock.init(cloud=pyrock.cloud("brk_live_abc123", push_interval=15.0))
 
 * Traces: OTLP/gRPC with ``x-bedrock-key`` metadata; a larger batch processor.
+  The target is ``traces_endpoint`` when set, otherwise derived from
+  ``endpoint``; either may be ``host:port`` or a URL (see
+  :func:`grpc_endpoint`). The connection uses h2c when ``insecure`` is set or
+  the target is an ``http://`` URL, TLS otherwise.
 * :class:`RetryExporter`: one initial attempt plus one retry per
   ``retry_backoff`` entry (default ``(1, 2, 4)`` s: 4 calls in all, as in Go),
-  waiting on an event so shutdown deadlines are honoured.
-* ``traces_endpoint`` optionally overrides the gRPC trace target; it accepts
-  ``host:port`` or a URL (scheme stripped, default port added, like Go).
-  Without it the target is derived from ``endpoint``.
+  waiting on an event so shutdown interrupts the back-off at once.
 * :class:`FanOutExporter`: with a local ``trace_url`` too, every batch goes to
   both; every exporter is always called, the first error is raised.
-* Metrics push: Prometheus text to ``{endpoint}/v1/metrics`` with
-  ``Authorization: Bearer``; overlapping pushes are skipped; final flush on
-  shutdown.
-* Profile push: OTLP profiles to ``{endpoint}/v1/profiles``.
+* Metrics push (:mod:`pyrock._push`): Prometheus text to
+  ``{endpoint}/v1/metrics`` with ``Authorization: Bearer``; overlapping pushes
+  are skipped; final flush on shutdown, bounded by the caller's timeout.
+* Profile push: OTLP profiles to ``{endpoint}/v1/profiles`` through
+  ``Bedrock.start_profile_export`` (so shutdown and fork handle it like any
+  other profile exporter); ``profiles=()`` disables it.
 
 ``pyrock.cloud`` and ``pyrock.CloudConfig`` are re-exported (lazily) from this
 private module. It is never imported by ``import pyrock``; the gRPC stack loads
@@ -26,18 +29,23 @@ only when wiring starts.
 from __future__ import annotations
 
 import datetime
+import logging
 import math
 import threading
-from collections.abc import Iterable, Sequence
+import time
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from pyrock._compat import is_nonempty_str, seconds
-from pyrock.profile import DEFAULT_PROFILE_TYPES, ProfileType
+from pyrock._compat import is_nonempty_str, is_positive_number, seconds
+from pyrock.profile import DEFAULT_PROFILE_TYPES, ProfileExportConfig, ProfileType
 from pyrock.trace import Span, SpanExporter
+from pyrock.trace.otlp import ExportError, PermanentExportError
+from pyrock.trace.otlp.batch import BatchProcessor
 
 if TYPE_CHECKING:
     from pyrock._bedrock import Bedrock
+    from pyrock._push import MetricsPusher
 
 __all__ = [
     "DEFAULT_ENDPOINT",
@@ -54,18 +62,38 @@ DEFAULT_ENDPOINT = "https://ingest.bedrock.dev"
 API_KEY_HEADER = "x-bedrock-key"
 DEFAULT_RETRY_BACKOFF: tuple[float, ...] = (1.0, 2.0, 4.0)
 MAX_RETRY_BACKOFF_ENTRIES = 10
+DEFAULT_GRPC_PORT = 4317
+"""Added to a gRPC target that names no port, as in Go's ``cloudGRPCEndpoint``."""
+
+CLOUD_MAX_QUEUE_SIZE = 10_000
+"""Queue of the cloud batch processor (Go: 10000, against 2048 locally)."""
+CLOUD_MAX_BATCH_SIZE = 512
+CLOUD_SCHEDULE_DELAY = 5.0
+
+_log = logging.getLogger("pyrock.cloud")
+
+
+# -- configuration ------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CloudConfig:
-    """Cloud settings. ``api_key`` is excluded from ``repr`` and equality."""
+    """Cloud settings. ``api_key`` is excluded from ``repr`` and equality.
+
+    Durations are seconds (a :class:`datetime.timedelta` is converted).
+    Construction validates every field and raises ``ValueError`` listing
+    every problem.
+    """
 
     api_key: str = field(repr=False, compare=False)
     endpoint: str = DEFAULT_ENDPOINT
+    """Base URL for metrics and profile pushes (and traces, unless ``traces_endpoint``)."""
     insecure: bool = False
+    """Plaintext h2c for traces and allow ``http://`` profile pushes (local development)."""
     push_interval: float = 15.0
     profile_interval: float = 60.0
     profile_cpu_sample_duration: float = 10.0
+    """Must be ``> 0`` and ``< profile_interval``."""
     profiles: tuple[ProfileType, ...] = DEFAULT_PROFILE_TYPES
     """``()`` disables cloud profiling."""
     retry_backoff: tuple[float, ...] = DEFAULT_RETRY_BACKOFF
@@ -83,38 +111,68 @@ class CloudConfig:
     def __post_init__(self) -> None:
         for name in ("push_interval", "profile_interval", "profile_cpu_sample_duration"):
             object.__setattr__(self, name, seconds(getattr(self, name)))
-        raw: Iterable[Any] = self.profiles
-        object.__setattr__(self, "profiles", tuple(dict.fromkeys(ProfileType(p) for p in raw)))
+        problems = [
+            *self._normalize_profiles(),
+            *self._normalize_backoff(),
+            *self._key_problems(),
+            *self._endpoint_problems(),
+            *self._interval_problems(),
+        ]
+        if problems:
+            raise ValueError("invalid CloudConfig: " + "; ".join(problems))
+
+    def _normalize_profiles(self) -> list[str]:
+        raw: object = self.profiles
+        if isinstance(raw, str) or not isinstance(raw, Iterable):
+            return ["profiles must be a sequence of ProfileType"]
+        try:
+            profiles = tuple(dict.fromkeys(ProfileType(p) for p in raw))
+        except ValueError as exc:
+            return [f"unknown profile type: {exc}"]
+        object.__setattr__(self, "profiles", profiles)
+        return []
+
+    def _normalize_backoff(self) -> list[str]:
+        raw: object = self.retry_backoff
+        if isinstance(raw, str | bytes) or not isinstance(raw, Iterable):
+            return ["retry_backoff must be a sequence of seconds"]
+        values = tuple(seconds(b) for b in raw)
+        object.__setattr__(self, "retry_backoff", values)
         problems: list[str] = []
-        backoff: object = self.retry_backoff
-        if isinstance(backoff, str | bytes) or not isinstance(backoff, Iterable):
-            problems.append("retry_backoff must be a sequence of seconds")
-        else:
-            values = tuple(seconds(b) for b in backoff)
-            object.__setattr__(self, "retry_backoff", values)
-            if len(values) > MAX_RETRY_BACKOFF_ENTRIES:
-                problems.append(
-                    f"retry_backoff must have at most {MAX_RETRY_BACKOFF_ENTRIES} entries"
-                )
-            if not all(_is_backoff(b) for b in values):
-                problems.append("retry_backoff entries must be finite and >= 0")
+        if len(values) > MAX_RETRY_BACKOFF_ENTRIES:
+            problems.append(f"retry_backoff must have at most {MAX_RETRY_BACKOFF_ENTRIES} entries")
+        if not all(_is_backoff(b) for b in values):
+            problems.append("retry_backoff entries must be finite and >= 0")
+        return problems
+
+    def _key_problems(self) -> list[str]:
+        if not is_nonempty_str(self.api_key):
+            return ["api_key must be a non-empty string"]
+        if any(c in self.api_key for c in "\r\n\0"):
+            return ["api_key contains control characters"]
+        return []
+
+    def _endpoint_problems(self) -> list[str]:
+        problems: list[str] = []
+        if not is_nonempty_str(self.endpoint):
+            problems.append("endpoint must be a non-empty string")
         traces: object = self.traces_endpoint
         if traces is not None and not is_nonempty_str(traces):
             problems.append("traces_endpoint must be a non-empty string or None")
-        if not is_nonempty_str(self.api_key):
-            problems.append("api_key must be a non-empty string")
-        elif any(c in self.api_key for c in "\r\n\0"):
-            problems.append("api_key contains control characters")
-        if not self.endpoint:
-            problems.append("endpoint must be non-empty")
-        if self.push_interval <= 0:
-            problems.append("push_interval must be positive")
-        if self.profile_interval <= 0:
-            problems.append("profile_interval must be positive")
-        if not 0 < self.profile_cpu_sample_duration < self.profile_interval:
+        return problems
+
+    def _interval_problems(self) -> list[str]:
+        problems: list[str] = []
+        if not is_positive_number(self.push_interval):
+            problems.append("push_interval must be positive and finite")
+        if not is_positive_number(self.profile_interval):
+            problems.append("profile_interval must be positive and finite")
+        elif not (
+            is_positive_number(self.profile_cpu_sample_duration)
+            and self.profile_cpu_sample_duration < self.profile_interval
+        ):
             problems.append("profile_cpu_sample_duration must be > 0 and < profile_interval")
-        if problems:
-            raise ValueError("invalid CloudConfig: " + "; ".join(problems))
+        return problems
 
 
 def _is_backoff(value: object) -> bool:
@@ -151,14 +209,49 @@ def cloud(
 
 
 def grpc_endpoint(endpoint: str, /) -> str:
-    """Normalize a gRPC target like Go.
+    """Normalize a gRPC target to ``host:port`` like Go's ``cloudGRPCEndpoint``.
 
-    ``https://ingest.bedrock.dev`` becomes ``ingest.bedrock.dev:443``. A bare
-    ``host:port`` is returned unchanged. With a URL the scheme is stripped
-    and the scheme's default port is added when none is given. Used for both
-    ``endpoint`` and ``traces_endpoint``.
+    An ``http://`` or ``https://`` scheme (any case) is stripped along with
+    any path, query or fragment, and port 4317 is added when none is given:
+    ``https://ingest.bedrock.dev`` becomes ``ingest.bedrock.dev:4317``. A bare
+    ``host:port`` is returned unchanged. IPv6 literals are written in brackets.
+    Used for both ``endpoint`` and ``traces_endpoint``; anything malformed is
+    rejected later by the gRPC exporter.
     """
-    raise NotImplementedError
+    scheme, sep, rest = endpoint.partition("://")
+    if sep and scheme.lower() in ("http", "https"):
+        endpoint = rest
+    for delimiter in "/?#":
+        endpoint = endpoint.partition(delimiter)[0]
+    if not _has_port(endpoint):
+        endpoint += f":{DEFAULT_GRPC_PORT}"
+    return endpoint
+
+
+def _has_port(authority: str) -> bool:
+    if authority.startswith("["):  # [v6]:port
+        return ":" in authority.rpartition("]")[2]
+    return ":" in authority
+
+
+def _uses_plaintext(config: CloudConfig) -> bool:
+    """h2c when asked for, or when the trace target is an ``http://`` URL (as in Go)."""
+    target = config.traces_endpoint or config.endpoint
+    return config.insecure or target.lower().startswith("http://")
+
+
+# -- exporters ----------------------------------------------------------------
+
+
+def _forward_fork(exporter: object) -> None:
+    """Call ``exporter._after_fork_in_child()`` when it defines one."""
+    reset = getattr(exporter, "_after_fork_in_child", None)
+    if callable(reset):
+        reset()
+
+
+def _remaining(deadline: float | None) -> float | None:
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
 
 
 class RetryExporter:
@@ -166,8 +259,11 @@ class RetryExporter:
 
     ``backoff[i]`` is the wait before retry ``i + 1``; the default
     ``(1, 2, 4)`` gives 4 calls in all, as in Go. ``()`` means one call and
-    no retries. Waits use ``stop`` (a :class:`threading.Event`), so shutdown
-    interrupts them.
+    no retries. Only retryable :class:`~pyrock.trace.otlp.ExportError` s are
+    retried; a :class:`~pyrock.trace.otlp.PermanentExportError` or any other
+    exception is raised at once. Waits are on an event that :meth:`shutdown`
+    sets, so shutdown interrupts a back-off immediately; a retry that would
+    start after the export's ``timeout`` is not attempted.
     """
 
     def __init__(
@@ -176,39 +272,182 @@ class RetryExporter:
         /,
         *,
         backoff: Sequence[float] = DEFAULT_RETRY_BACKOFF,
-        stop: threading.Event | None = None,
     ) -> None:
-        raise NotImplementedError
+        self._exporter = exporter
+        self._backoff = tuple(backoff)
+        self._stopped = threading.Event()
 
     def export(self, spans: Sequence[Span], /, *, timeout: float | None = None) -> None:
-        raise NotImplementedError
+        """Export ``spans``, retrying; raises the last error once retries are exhausted."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for attempt, delay in enumerate((*self._backoff, None), start=1):
+            try:
+                self._exporter.export(spans, timeout=_remaining(deadline))
+            except PermanentExportError:
+                raise
+            except ExportError as exc:
+                if delay is None or not self._wait(delay, deadline):
+                    _log.error("cloud trace export failed after %d attempt(s): %s", attempt, exc)
+                    raise
+                _log.warning(
+                    "cloud trace export failed, retrying: attempt=%d backoff=%gs error=%s",
+                    attempt,
+                    delay,
+                    exc,
+                )
+            else:
+                return
+
+    def _wait(self, delay: float, deadline: float | None) -> bool:
+        """Back off for ``delay``; ``False`` if shut down or the deadline comes first."""
+        remaining = _remaining(deadline)
+        if remaining is not None and remaining < delay:
+            return False
+        return not self._stopped.wait(delay)
 
     def shutdown(self, *, timeout: float | None = None) -> None:
         """Interrupt any back-off wait, then shut the wrapped exporter down."""
-        raise NotImplementedError
+        self._stopped.set()
+        self._exporter.shutdown(timeout=timeout)
+
+    def _after_fork_in_child(self) -> None:
+        """Fresh stop event (same state) and forward the hook to the wrapped exporter."""
+        stopped = threading.Event()
+        if self._stopped.is_set():
+            stopped.set()
+        self._stopped = stopped
+        _forward_fork(self._exporter)
 
 
 class FanOutExporter:
-    """Sends each batch to every exporter; raises the first error after calling all."""
+    """Sends each batch to every exporter; raises the first error after calling all.
+
+    The exporters run in order and share one ``timeout`` deadline, as Go's
+    exporters share one context.
+    """
 
     def __init__(self, *exporters: SpanExporter) -> None:
-        raise NotImplementedError
+        self._exporters = exporters
 
     def export(self, spans: Sequence[Span], /, *, timeout: float | None = None) -> None:
-        raise NotImplementedError
+        """Export to every exporter; then raise the first error, if any."""
+        _call_all(self._exporters, timeout, lambda e, t: e.export(spans, timeout=t))
 
     def shutdown(self, *, timeout: float | None = None) -> None:
-        raise NotImplementedError
+        """Shut every exporter down; then raise the first error, if any."""
+        _call_all(self._exporters, timeout, lambda e, t: e.shutdown(timeout=t))
+
+    def _after_fork_in_child(self) -> None:
+        """Forward the fork hook to every exporter."""
+        for exporter in self._exporters:
+            _forward_fork(exporter)
+
+
+def _call_all(
+    exporters: Iterable[SpanExporter],
+    timeout: float | None,
+    call: Callable[[SpanExporter, float | None], None],
+) -> None:
+    """``call(exporter, remaining)`` for each exporter, then raise the first error."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    first: Exception | None = None
+    for exporter in exporters:
+        try:
+            call(exporter, _remaining(deadline))
+        except Exception as exc:  # every exporter must be called, whatever the others do
+            if first is None:
+                first = exc
+    if first is not None:
+        raise first
+
+
+# -- wiring -------------------------------------------------------------------
 
 
 class CloudWiring:
-    """Handles to the cloud workers started by :func:`wire`."""
+    """Handles to the cloud workers started by :func:`wire`.
+
+    Only the metrics pusher lives here: the trace pipeline belongs to the
+    tracer and the profile exporter to the :class:`~pyrock.Bedrock`, which
+    stop and fork-reset them.
+    """
+
+    def __init__(self, pusher: MetricsPusher, /) -> None:
+        self._pusher = pusher
 
     def stop(self, *, timeout: float | None = None) -> None:
         """Final metrics push and stop all cloud workers, bounded by ``timeout``."""
-        raise NotImplementedError
+        self._pusher.stop(timeout=timeout)
+
+    def _after_fork_in_child(self) -> None:
+        """Restart the metrics push in a forked child (called by the core fork hook)."""
+        self._pusher._after_fork_in_child()
 
 
 def wire(bedrock: Bedrock, config: CloudConfig, /) -> CloudWiring:
-    """Replace the batch processor and start metrics and profile push for ``bedrock``."""
-    raise NotImplementedError
+    """Replace the batch processor and start metrics and profile push for ``bedrock``.
+
+    Everything that can fail validation is built before anything starts, so a
+    ``ValueError`` (for example a malformed endpoint) leaves ``bedrock``
+    unchanged. A profile configuration the profiler rejects is logged and
+    skipped, as in Go.
+    """
+    from pyrock._push import MetricsPusher
+
+    exporter = _trace_exporter(bedrock, config)
+    base = config.endpoint.rstrip("/")
+    auth = {"Authorization": f"Bearer {config.api_key}"}
+    pusher = MetricsPusher(
+        bedrock.metrics, endpoint=f"{base}/v1/metrics", headers=auth, interval=config.push_interval
+    )
+    profiles = _profile_config(config, base, auth)
+    bedrock.tracer.set_processor(
+        BatchProcessor(
+            exporter,
+            max_queue_size=CLOUD_MAX_QUEUE_SIZE,
+            max_batch_size=CLOUD_MAX_BATCH_SIZE,
+            schedule_delay=CLOUD_SCHEDULE_DELAY,
+        )
+    )
+    if profiles is not None:
+        bedrock.start_profile_export(profiles)
+    pusher.start()
+    return CloudWiring(pusher)
+
+
+def _trace_exporter(bedrock: Bedrock, config: CloudConfig) -> SpanExporter:
+    """The retrying gRPC exporter, fanned out with the local one when there is one."""
+    from pyrock.trace.otlp.grpc import GRPCExporter
+
+    grpc = GRPCExporter(
+        grpc_endpoint(config.traces_endpoint or config.endpoint),
+        service=bedrock.config.service,
+        resource=bedrock.tracer.resource,
+        headers={API_KEY_HEADER: config.api_key},
+        insecure=_uses_plaintext(config),
+    )
+    cloud_exporter = RetryExporter(grpc, backoff=config.retry_backoff)
+    processor = bedrock.tracer.processor
+    if isinstance(processor, BatchProcessor):  # a local trace_url pipeline
+        return FanOutExporter(processor.exporter, cloud_exporter)
+    return cloud_exporter
+
+
+def _profile_config(
+    config: CloudConfig, base: str, headers: dict[str, str]
+) -> ProfileExportConfig | None:
+    """The cloud profile export settings; ``None`` when disabled or rejected."""
+    if not config.profiles:
+        return None
+    try:
+        return ProfileExportConfig(
+            endpoint=f"{base}/v1/profiles",
+            headers=headers,
+            types=config.profiles,
+            interval=config.profile_interval,
+            cpu_sample_duration=config.profile_cpu_sample_duration,
+            allow_http=config.insecure,
+        )
+    except ValueError as exc:
+        _log.warning("cloud profile export disabled: %s", exc)
+        return None
