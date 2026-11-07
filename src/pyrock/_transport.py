@@ -29,7 +29,7 @@ HEADER_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _BAD_VALUE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 
 
-def header_problems(headers: Mapping[str, str], *, field: str = "headers") -> list[str]:
+def header_problems(headers: Mapping[Any, Any], *, field: str = "headers") -> list[str]:
     """Return one problem per invalid header; empty when all are valid.
 
     Names must be RFC 9110 tokens and values must not contain control
