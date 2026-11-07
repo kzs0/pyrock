@@ -78,17 +78,20 @@ def test_imports_only_stdlib_or_pyrock(name: str) -> None:
 
 # Internal dependency boundaries (DESIGN §3). Keys are the first component under
 # ``pyrock``; values are the components that module tree may import. ``None``
-# means "top-level module: may import anything". Utility leaves (_types,
-# _compat, _version) may be imported by any non-leaf module.
-UTILITY = {"_types", "_compat", "_version"}
+# means "top-level module: may import anything". Utility modules (_types,
+# _compat, _version, _transport) import nothing from pyrock themselves and may
+# be imported by any other module, including the data leaves.
+UTILITY = {"_types", "_compat", "_version", "_transport"}
 BOUNDARIES: dict[str, set[str] | None] = {
-    # leaves: import nothing from pyrock
-    "attr": set(),
-    "env": set(),
-    "privacy": set(),
+    # utilities: import nothing from pyrock
     "_types": set(),
     "_compat": set(),
     "_version": set(),
+    "_transport": set(),
+    # data leaves: only utilities
+    "attr": UTILITY,
+    "env": UTILITY,
+    "privacy": UTILITY,
     # services
     "trace": {"attr", "privacy", *UTILITY},
     "metric": {"attr", "privacy", *UTILITY},
@@ -104,6 +107,7 @@ BOUNDARIES: dict[str, set[str] | None] = {
     "_context": None,
     "_noop": None,
     "_operation": None,
+    "_httpcore": None,
     "wsgi": None,
     "asgi": None,
     "http": None,

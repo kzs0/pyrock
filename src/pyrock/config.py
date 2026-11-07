@@ -43,11 +43,12 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import os
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TextIO
 
 from pyrock._compat import (
+    ConfigError,
     is_nonempty_str,
     is_number,
     is_positive_int,
@@ -142,16 +143,6 @@ _ENV_PARSERS: Mapping[str, Callable[[str], Any]] = {
     "metric_buckets": _parse_buckets,
 }
 """Field -> parser for non-string variables; the rest are taken verbatim."""
-
-
-class ConfigError(ValueError):
-    """Invalid configuration. :attr:`problems` lists every problem, not just the first."""
-
-    problems: list[str]
-
-    def __init__(self, problems: Iterable[str]) -> None:
-        self.problems = list(problems)
-        super().__init__("invalid pyrock configuration: " + "; ".join(self.problems))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

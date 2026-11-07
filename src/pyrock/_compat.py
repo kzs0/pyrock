@@ -7,9 +7,11 @@ behind feature detection here, so the rest of the package stays valid on 3.11.
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterable
 from typing import Any
 
 __all__ = [
+    "ConfigError",
     "gil_enabled",
     "is_free_threaded_build",
     "is_nonempty_str",
@@ -18,6 +20,21 @@ __all__ = [
     "is_positive_number",
     "seconds",
 ]
+
+
+class ConfigError(ValueError):
+    """Invalid configuration. :attr:`problems` lists every problem, not just the first.
+
+    Raised by every pyrock configuration type (``pyrock.Config``,
+    ``server.Config``, ``CloudConfig``, ``ProfileExportConfig``). It lives in this
+    utility module so each of them can raise it without import cycles.
+    """
+
+    problems: list[str]
+
+    def __init__(self, problems: Iterable[str]) -> None:
+        self.problems = list(problems)
+        super().__init__("invalid pyrock configuration: " + "; ".join(self.problems))
 
 
 def gil_enabled() -> bool:
