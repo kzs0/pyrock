@@ -102,8 +102,8 @@ class ContextThreadPoolExecutor(ThreadPoolExecutor):
     """
 
     def submit(self, fn: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs) -> Future[R]:
-        context = contextvars.copy_context()
-        return super().submit(context.run, fn, *args, **kwargs)
+        run: Callable[..., R] = contextvars.copy_context().run
+        return super().submit(run, fn, *args, **kwargs)
 
 
 class Thread(threading.Thread):
