@@ -71,7 +71,7 @@ include = ["src/pyrock", "tests", "README.md", "CHANGELOG.md", "LICENSE", "DESIG
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-src = ["src", "tests"]
+src = ["src", "tests", "scripts"]
 # Docs (DESIGN.md etc.) contain illustrative snippets, not formatted code.
 extend-exclude = ["*.md"]
 
@@ -109,6 +109,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["ANN", "S", "T20", "PERF", "B011"]
+"scripts/tests/**" = ["ANN", "S", "T20", "PERF", "B011"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["pyrock"]
@@ -125,7 +126,8 @@ strict = true
 warn_unreachable = true
 warn_unused_ignores = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
-files = ["src"]
+# scripts/ holds CI tooling (stdlib only); `make report-check` type-checks it.
+files = ["src", "scripts"]
 mypy_path = "src"
 
 # ---------------------------------------------------------------- pytest
