@@ -31,3 +31,7 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# Profiler output
+*.prof
+prof.out
