@@ -280,10 +280,13 @@ def test_instrument_http_server_additional_labels_and_attrs() -> None:
 
 def test_instrument_http_server_success_codes() -> None:
     handler = pyrock.http.instrument_http_server(_Hello, success_codes={201, 404})
-    with capture() as t, serve_handler(handler) as base:
-        _get(base, "/created")
-        _get(base, "/missing")
-        _get(base, "/")
+    with capture() as t:
+        with serve_handler(handler) as base:
+            _get(base, "/created")
+            _get(base, "/missing")
+            _get(base, "/")
+        # The handler ends its operation after writing the response, so read the
+        # metrics only once the server has shut down and finished the request.
         assert t.metrics.value("http_request_successes") == 2
         assert t.metrics.value("http_request_failures", http_status_code="200") == 1
 
