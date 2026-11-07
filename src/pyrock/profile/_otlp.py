@@ -22,7 +22,7 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from pyrock._version import __version__
+from pyrock._version import SCOPE_NAME, __version__
 from pyrock.attr import AttrValue
 from pyrock.profile._pprof import (
     MAPPING_NAME,
@@ -44,7 +44,6 @@ LabelFilter = Callable[[Mapping[str, str | int]], Mapping[str, Any]]
 MAX_LABELS = 64
 MAX_LABEL_NODES = 4096
 MAX_LABEL_DEPTH = 8
-_SCOPE_NAME = "pyrock"
 
 
 def _basename(path: str) -> str:
@@ -194,7 +193,7 @@ def _resource(service: str, resource: Mapping[str, AttrValue] | None) -> Writer:
 
 def _scope() -> Writer:
     w = Writer()
-    w.string(1, _SCOPE_NAME)
+    w.string(1, SCOPE_NAME)
     w.string(2, __version__)
     return w
 

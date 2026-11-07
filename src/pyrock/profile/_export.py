@@ -22,8 +22,9 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+from pyrock._transport import no_redirect_opener
 from pyrock._version import __version__
 from pyrock.attr import AttrValue
 from pyrock.privacy import Policy
@@ -37,7 +38,6 @@ from pyrock.profile._stacks import thread_profile
 
 if TYPE_CHECKING:
     import asyncio
-    import ssl
 
 __all__ = ["LoopsSource", "ProfileExporter", "start_export"]
 
@@ -48,20 +48,6 @@ _log = logging.getLogger("pyrock.profile")
 
 _RETRY_STEP = 0.1
 """Back-off before retry ``n`` is ``n * 0.1`` seconds, as in Go."""
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Redirects are never followed: headers usually carry credentials."""
-
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-        return None
-
-
-def _opener(ssl_context: ssl.SSLContext | None) -> urllib.request.OpenerDirector:
-    handlers: list[urllib.request.BaseHandler] = [_NoRedirect()]
-    if ssl_context is not None:
-        handlers.append(urllib.request.HTTPSHandler(context=ssl_context))
-    return urllib.request.build_opener(*handlers)
 
 
 def _retryable(status: int | None) -> bool:
@@ -93,7 +79,7 @@ class ProfileExporter:
         )
         self._source_paths = policy.allow_source_paths
         self._loops = loops
-        self._opener = _opener(config.ssl_context)
+        self._opener = no_redirect_opener(config.ssl_context)
         self._headers = {
             "Content-Type": CONTENT_TYPE,
             "User-Agent": f"pyrock/{__version__}",

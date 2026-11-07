@@ -109,9 +109,8 @@ def app(
 
     def collect(name: str, query: dict[str, list[str]]) -> Profile | str | None:
         """The profile (or ``goroutine?debug`` text); ``None`` when the sampler is busy."""
-        seconds = _seconds(query, max_seconds)
-        if name == "profile":
-            return SamplingProfiler(cpu=True).collect(seconds)
+        if name == "profile":  # ``seconds`` is validated only where it is used
+            return SamplingProfiler(cpu=True).collect(_seconds(query, max_seconds))
         if name == "heap":
             return heap.snapshot()
         if name == "goroutine":

@@ -18,6 +18,7 @@ This package is never imported by ``import pyrock``; it loads on first use.
 
 from __future__ import annotations
 
+from pyrock.profile import _heap, _locks, _sampler
 from pyrock.profile._config import (
     DEFAULT_PROFILE_TYPES,
     ProfileExportConfig,
@@ -39,3 +40,19 @@ __all__ = [
     "Semaphore",
     "start_export",
 ]
+
+
+def _after_fork_in_child() -> None:
+    """Reset process-wide profiling state in a forked child (pyrock's fork hook calls it).
+
+    Acquires no lock: any lock a parent thread held at fork time is replaced.
+    The sampler slot is freed, contention recorders are rebuilt empty, heap
+    profiler locks are replaced, and tracemalloc tracing that pyrock started in
+    the parent is stopped. Call it before restarting profile exporters in the
+    child (claims made by the child itself are kept either way). Call it only
+    when ``pyrock.profile`` is already imported (``sys.modules``), so a fork
+    never imports profiling.
+    """
+    _sampler._after_fork_in_child()
+    _locks._after_fork_in_child()
+    _heap._after_fork_in_child()

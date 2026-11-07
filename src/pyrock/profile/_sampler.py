@@ -45,7 +45,12 @@ _CPU = SampleType("cpu", "nanoseconds")
 _WALL = SampleType("wall", "nanoseconds")
 
 _owner_lock = threading.Lock()
-_owned = False
+_owner_pid: int | None = None
+"""The pid of the process whose sampler holds the slot; guarded by ``_owner_lock``.
+
+A claim inherited through ``fork`` carries the parent's pid, so it never
+blocks the child.
+"""
 
 
 def cpu_clock_available() -> bool:
@@ -61,21 +66,34 @@ def cpu_clock_available() -> bool:
 
 def acquire_ownership() -> bool:
     """Claim the process-wide sampler slot; ``False`` if another sampler owns it."""
-    global _owned
+    global _owner_pid
     if os.environ.get(OWNER_ENV):
         return False
+    pid = os.getpid()
     with _owner_lock:
-        if _owned:
+        if _owner_pid == pid:
             return False
-        _owned = True
+        _owner_pid = pid
         return True
 
 
 def release_ownership() -> None:
     """Give the process-wide sampler slot back (no-op if it is free)."""
-    global _owned
+    global _owner_pid
     with _owner_lock:
-        _owned = False
+        _owner_pid = None
+
+
+def _after_fork_in_child() -> None:
+    """Free the sampler slot in a forked child without touching the inherited lock.
+
+    A sampler running in the parent at fork time has no thread in the child, so
+    its claim is void; the lock may have been held by another parent thread.
+    """
+    global _owner_lock, _owner_pid
+    _owner_lock = threading.Lock()
+    if _owner_pid != os.getpid():
+        _owner_pid = None
 
 
 class _ThreadCPUClock:

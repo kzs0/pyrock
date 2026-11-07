@@ -82,12 +82,6 @@ class _Recorder:
                 entry[0] += count
                 entry[1] += delay_ns
 
-    def reset(self) -> None:
-        with self.lock:
-            self.totals = {}
-            self.stacks.clear()
-            self.since_ns = time.time_ns()
-
     def profile(self, period: int) -> Profile:
         with self.lock:
             samples = tuple(
@@ -126,9 +120,21 @@ def settings() -> tuple[int, float]:
 
 
 def reset() -> None:
-    """Forget every recorded contention (sampling settings are kept)."""
-    _mutex.reset()
-    _block.reset()
+    """Forget every recorded contention (sampling settings are kept).
+
+    Swaps in fresh recorders instead of clearing the old ones, so it acquires
+    no lock and is safe in a forked child even if a parent thread held a
+    recorder lock at fork time. A recording racing with it lands in the
+    discarded recorder, as if it happened just before the reset.
+    """
+    global _mutex, _block
+    _mutex = _Recorder()
+    _block = _Recorder()
+
+
+def _after_fork_in_child() -> None:
+    """Fresh, empty recorders in a forked child (contention seen by the parent is dropped)."""
+    reset()
 
 
 def mutex_profile() -> Profile:

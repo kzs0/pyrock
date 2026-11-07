@@ -1,7 +1,10 @@
 """Heap profiles from ``tracemalloc`` snapshot diffs.
 
 tracemalloc starts only when ``HEAP`` is selected, with ``traceback_limit``
-frames, and is never stopped if someone else started it.
+frames, and is never stopped if someone else started it. A forked child stops
+tracing it inherited only if pyrock started it in the parent (see
+:func:`_after_fork_in_child`); a child exporter selecting ``HEAP`` starts it
+again and owns it.
 
 Each :meth:`HeapProfiler.snapshot` compares the live traced memory with the
 previous snapshot, per allocation traceback:
@@ -18,10 +21,13 @@ frame is named ``file:line``.
 
 from __future__ import annotations
 
+import itertools
+import os
 import sys
 import threading
 import time
 import tracemalloc
+import weakref
 from collections import deque
 from collections.abc import Iterable
 from types import CodeType, FunctionType, ModuleType
@@ -42,6 +48,32 @@ _MAX_INDEXED_FILES = 4096
 
 # Starting and stopping tracemalloc is process-wide: serialize ownership changes.
 _tracing_lock = threading.Lock()
+_owner: tuple[int, int] | None = None
+"""``(pid, token)`` of the profiler that started tracing; guarded by ``_tracing_lock``.
+
+The pid makes a claim inherited through ``fork`` recognisable as the parent's.
+"""
+_tokens = itertools.count(1)
+_profilers: weakref.WeakSet[HeapProfiler] = weakref.WeakSet()
+"""Live profilers, so a forked child can replace their (possibly held) locks."""
+
+
+def _after_fork_in_child() -> None:
+    """Make heap profiling usable in a forked child, acquiring no inherited lock.
+
+    Every lock is replaced. If pyrock started tracemalloc in the parent, the
+    child stops it: no profiler in the child owns it, so it would otherwise
+    trace (and cost) forever. Tracing someone else started is left alone.
+    """
+    global _tracing_lock, _owner
+    _tracing_lock = threading.Lock()
+    for profiler in list(_profilers):
+        profiler._lock = threading.Lock()
+        profiler._previous = None
+    if _owner is not None and _owner[0] != os.getpid():
+        _owner = None
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
 
 
 class HeapProfiler:
@@ -51,19 +83,34 @@ class HeapProfiler:
         if traceback_limit < 1:
             raise ValueError("traceback_limit must be >= 1")
         self._traceback_limit = traceback_limit
-        self._owns_tracing = False
+        self._token = next(_tokens)
         self._lock = threading.Lock()
         self._previous: tracemalloc.Snapshot | None = None
         self._previous_wall_ns = time.time_ns()
         self._names = _FunctionNames()
+        _profilers.add(self)
+
+    @property
+    def _claim(self) -> tuple[int, int]:
+        return (os.getpid(), self._token)
 
     def start(self) -> None:
-        """Start tracemalloc if it is not already tracing (remembering who owns it)."""
+        """Start tracemalloc if it is not already tracing (remembering who owns it).
+
+        Tracing that pyrock started in a parent process (inherited through
+        ``fork``) is adopted, so this profiler stops it later.
+        """
+        global _owner
         with _tracing_lock:
-            if self._owns_tracing or tracemalloc.is_tracing():
+            claim = self._claim
+            if _owner == claim:
                 return
-            tracemalloc.start(self._traceback_limit)
-            self._owns_tracing = True
+            if tracemalloc.is_tracing():
+                if _owner is None or _owner[0] == claim[0]:
+                    return  # someone else's tracing, or another pyrock profiler's here
+            else:
+                tracemalloc.start(self._traceback_limit)
+            _owner = claim
         with self._lock:
             self._previous = None
             self._previous_wall_ns = time.time_ns()
@@ -86,10 +133,11 @@ class HeapProfiler:
 
     def stop(self) -> None:
         """Stop tracemalloc only if this profiler started it."""
+        global _owner
         with _tracing_lock:
-            if not self._owns_tracing:
+            if _owner != self._claim:
                 return
-            self._owns_tracing = False
+            _owner = None
             tracemalloc.stop()
         with self._lock:
             self._previous = None

@@ -26,8 +26,11 @@ wake a thread blocked on it on Windows). A connection over the cap is answered `
 with ``Connection: close`` by a short-lived (and itself bounded) thread.
 Responses are buffered, so a failing application never leaves partial output
 and every response carries ``Content-Length`` for keep-alive. Request bodies
-are read in full (at most 1 MiB); ``Transfer-Encoding`` is not supported
-(``501``), which the observability endpoints never need.
+are read in full (at most 1 MiB), after a ``100 Continue`` when the client
+asks for one; ``Transfer-Encoding`` is not supported (``501``), which the
+observability endpoints never need. The write deadline (``write_timeout``)
+starts once the handler has produced its response, so a handler that takes a
+while (a pprof CPU profile) still gets its full write window.
 
 Import rules: ``pyrock.server`` imports only ``pyrock.metric`` (and leaf
 modules) from pyrock.
@@ -49,7 +52,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import unquote
 
-from pyrock._compat import is_positive_number, seconds
+from pyrock._compat import ConfigError, is_positive_int, is_positive_number, seconds
+from pyrock._transport import HEADER_NAME
 from pyrock._types import ExcInfo, StartResponse, WSGIApp, WSGIEnviron
 from pyrock.metric import Registry, prometheus
 
@@ -70,11 +74,12 @@ _ACCEPT_BACKOFF_SECONDS = 0.1
 _PPROF_PREFIX = "/debug/pprof/"
 
 _DIGITS = re.compile(r"[0-9]+")
-_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _TARGET = re.compile(r"/[\x21-\x7e]*")
 _VERSION = re.compile(r"HTTP/[0-9]\.[0-9]")
 _FIELD_TEXT = re.compile(r"[\t\x20-\x7e\x80-\xff]*")
 _STATUS = re.compile(r"[1-5][0-9]{2}(?: [\t\x20-\x7e\x80-\xff]*)?")
+_CONTINUE = b"HTTP/1.1 100 Continue\r\n\r\n"
+"""The interim response a client sending ``Expect: 100-continue`` waits for."""
 _SUPPORTED_VERSIONS = frozenset({"HTTP/1.0", "HTTP/1.1"})
 _MANAGED_HEADERS = frozenset(
     {"connection", "content-length", "date", "keep-alive", "transfer-encoding", "upgrade"}
@@ -133,20 +138,21 @@ class Config:
             object.__setattr__(self, name, value)
             if not is_positive_number(value):
                 problems.append(f"{name} must be positive")
-        if self.max_header_bytes <= 0:
-            problems.append("max_header_bytes must be positive")
-        if self.max_connections <= 0:
-            problems.append("max_connections must be positive")
+        for name in ("max_header_bytes", "max_connections"):
+            if not is_positive_int(getattr(self, name)):
+                problems.append(f"{name} must be a positive int")
         try:
             _split_addr(self.addr)
-        except ValueError:
+        except (TypeError, ValueError):
             problems.append("addr must be 'host:port'")
         if problems:
-            raise ValueError("invalid server Config: " + "; ".join(problems))
+            raise ConfigError(f"server.Config: {problem}" for problem in problems)
 
 
 def _split_addr(addr: str, /) -> tuple[str, int]:
     """Split ``host:port`` (``[v6]:port`` too) into a bindable host and an int port."""
+    if not isinstance(addr, str):
+        raise TypeError("addr must be a str")
     host, sep, port = addr.rpartition(":")
     if not sep or not _DIGITS.fullmatch(port) or int(port) > 65535:
         raise ValueError(f"invalid address {addr!r}")
@@ -261,6 +267,16 @@ class _Request:
         return "close" not in tokens
 
     @property
+    def expects_continue(self) -> bool:
+        """Whether an HTTP/1.1 client waits for ``100 Continue`` before sending its body."""
+        expect = self.header("expect")
+        return (
+            self.version == "HTTP/1.1"
+            and expect is not None
+            and expect.strip().lower() == "100-continue"
+        )
+
+    @property
     def content_length(self) -> int:
         """The request body length (``_HTTPError`` for unsupported or invalid framing)."""
         if self.header("transfer-encoding") is not None:
@@ -283,7 +299,9 @@ def _parse_head(head: bytes, /) -> _Request:
     if len(parts) != 3:
         raise _HTTPError(400)
     method, target, version = parts
-    if not (_TOKEN.fullmatch(method) and _TARGET.fullmatch(target) and _VERSION.fullmatch(version)):
+    if not (
+        HEADER_NAME.fullmatch(method) and _TARGET.fullmatch(target) and _VERSION.fullmatch(version)
+    ):
         raise _HTTPError(400)
     if version not in _SUPPORTED_VERSIONS:
         raise _HTTPError(505)
@@ -301,7 +319,7 @@ def _parse_fields(lines: Iterable[str], /) -> list[tuple[str, str]]:
     for line in lines:
         name, sep, value = line.partition(":")
         value = value.strip(" \t")
-        if not (sep and _TOKEN.fullmatch(name) and _FIELD_TEXT.fullmatch(value)):
+        if not (sep and HEADER_NAME.fullmatch(name) and _FIELD_TEXT.fullmatch(value)):
             raise _HTTPError(400)
         fields.append((name.lower(), value))
     return fields
@@ -375,6 +393,10 @@ def _run_app(app: WSGIApp, environ: WSGIEnviron, /) -> _Response:
     ) -> Callable[[bytes], object]:
         # Nothing is sent before the app returns, so a later call (an error
         # page, with ``exc_info``) simply replaces the earlier status and output.
+        # A second call without ``exc_info`` is an application bug (PEP 3333).
+        if started and exc_info is None:
+            raise RuntimeError("start_response called a second time without exc_info")
+        exc_info = None  # PEP 3333: do not keep the traceback alive
         started[:] = [(status, list(headers))]
         chunks.clear()
         return chunks.append
@@ -398,7 +420,7 @@ def _check_response_head(status: str, headers: list[tuple[str, str]], /) -> None
     if not _STATUS.fullmatch(status):
         raise ValueError(f"invalid WSGI status {status!r}")
     for name, value in headers:
-        if not (_TOKEN.fullmatch(name) and _FIELD_TEXT.fullmatch(value)):
+        if not (HEADER_NAME.fullmatch(name) and _FIELD_TEXT.fullmatch(value)):
             raise ValueError(f"invalid WSGI response header {name!r}")
 
 
@@ -744,14 +766,20 @@ class Server:
             if not head:
                 return b"", False
             request = _parse_head(head)
-            write_deadline = time.monotonic() + cfg.write_timeout
+            length = request.content_length
+            if len(buffered) < length and request.expects_continue:
+                _send_before(conn.sock, _CONTINUE, time.monotonic() + cfg.write_timeout)
             body, buffered = _read_body(
-                conn.sock, request.content_length, buffered, deadline=started + cfg.read_timeout
+                conn.sock, length, buffered, deadline=started + cfg.read_timeout
             )
         except (TimeoutError, _HeaderTooLarge, _HTTPError) as exc:
             self._send_error(conn.sock, _error_status(exc))
             return b"", False
         response = self._dispatch(request, body, conn.peer)
+        # The write deadline starts once the response exists: responses are
+        # buffered, so nothing was written while the handler ran (a pprof CPU
+        # profile samples for up to ``seconds`` before it has anything to send).
+        write_deadline = time.monotonic() + cfg.write_timeout
         keep_alive = request.keep_alive and not self._stopping.is_set()
         data = _encode_response(response, keep_alive=keep_alive, head_only=request.method == "HEAD")
         _send_before(conn.sock, data, write_deadline)

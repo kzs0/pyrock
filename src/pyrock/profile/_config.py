@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from pyrock._compat import is_nonempty_str, seconds
+from pyrock._compat import ConfigError, is_number, is_positive_number, seconds
+from pyrock._transport import header_problems
 
 __all__ = [
     "DEFAULT_PROFILE_TYPES",
@@ -55,8 +56,8 @@ class ProfileExportConfig:
 
     ``headers`` are excluded from ``repr`` because they usually carry
     credentials. ``types=()`` disables collection. Redirects are never
-    followed. Construction validates and raises ``ValueError`` listing every
-    problem.
+    followed. Construction validates and raises :class:`pyrock.ConfigError` (a
+    ``ValueError``) listing every problem; durations must be finite.
     """
 
     endpoint: str
@@ -83,17 +84,26 @@ class ProfileExportConfig:
         for name in ("interval", "cpu_sample_duration", "timeout", "block_sample_rate"):
             object.__setattr__(self, name, seconds(getattr(self, name)))
         object.__setattr__(self, "headers", dict(self.headers))
+        problems = [
+            *self._type_problems(),
+            *self._endpoint_problems(),
+            *self._limit_problems(),
+            *self._header_problems(),
+        ]
+        if problems:
+            raise ConfigError(f"ProfileExportConfig: {problem}" for problem in problems)
+
+    def _type_problems(self) -> list[str]:
+        """Coerce ``types`` to a de-duplicated tuple of :class:`ProfileType`."""
         raw_types: Iterable[Any] = self.types
         if isinstance(raw_types, str):
-            raise ValueError("types must be a sequence of ProfileType")
+            return ["types must be a sequence of ProfileType"]
         try:
             types = tuple(dict.fromkeys(ProfileType(t) for t in raw_types))
-        except ValueError as exc:
-            raise ValueError(f"unknown profile type: {exc}") from None
+        except (TypeError, ValueError) as exc:
+            return [f"unknown profile type: {exc}"]
         object.__setattr__(self, "types", types)
-        problems = [*self._endpoint_problems(), *self._limit_problems(), *self._header_problems()]
-        if problems:
-            raise ValueError("invalid ProfileExportConfig: " + "; ".join(problems))
+        return []
 
     def _endpoint_problems(self) -> list[str]:
         endpoint: object = self.endpoint
@@ -108,31 +118,32 @@ class ProfileExportConfig:
 
     def _limit_problems(self) -> list[str]:
         problems: list[str] = []
-        if self.interval <= 0:
-            problems.append("interval must be positive")
-        if not 0 < self.cpu_sample_duration < self.interval:
+        interval_ok = is_positive_number(self.interval)
+        if not interval_ok:
+            problems.append("interval must be a positive finite number")
+        duration = self.cpu_sample_duration
+        if not (is_positive_number(duration) and (not interval_ok or duration < self.interval)):
             problems.append("cpu_sample_duration must be > 0 and < interval")
         if not _is_int(self.sample_hz) or not 1 <= self.sample_hz <= 1000:
             problems.append("sample_hz must be within 1..1000")
-        if self.timeout <= 0:
-            problems.append("timeout must be positive")
+        if not is_positive_number(self.timeout):
+            problems.append("timeout must be a positive finite number")
         if not _is_int(self.max_bytes) or not 0 < self.max_bytes <= MAX_BYTES_LIMIT:
             problems.append(f"max_bytes must be within 1..{MAX_BYTES_LIMIT}")
         if not _is_int(self.retries) or not 0 <= self.retries <= MAX_RETRIES:
             problems.append(f"retries must be within 0..{MAX_RETRIES}")
         if not _is_int(self.mutex_sample_fraction) or self.mutex_sample_fraction < 0:
             problems.append("mutex_sample_fraction must be >= 0")
-        if self.block_sample_rate < 0:
-            problems.append("block_sample_rate must be >= 0")
+        if not (is_number(self.block_sample_rate) and self.block_sample_rate >= 0):
+            problems.append("block_sample_rate must be a finite number >= 0")
         return problems
 
     def _header_problems(self) -> list[str]:
-        problems: list[str] = []
-        for key, value in self.headers.items():
-            if not (is_nonempty_str(key) and isinstance(value, str)):
-                problems.append("headers must map str to str")
-            elif any(c in key + value for c in "\r\n\0"):
-                problems.append(f"header {key!r} contains control characters")
+        problems = header_problems(self.headers)
+        if problems:
+            problems.append(
+                "headers: names must be HTTP tokens and values str without control characters"
+            )
         return problems
 
 
