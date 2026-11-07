@@ -1,0 +1,21 @@
+"""OTLP trace export: HTTP/JSON (:mod:`.http`), gRPC (:mod:`.grpc`) and batching.
+
+Submodules load lazily; importing this package is cheap. ``grpc`` and ``_h2``
+are only imported when a gRPC endpoint is configured.
+
+Every export carries the instrumentation scope ``name="pyrock"`` and
+``version=pyrock.__version__``. Static attrs travel as *resource* attributes
+(as in Go), not as span attributes.
+"""
+
+from __future__ import annotations
+
+__all__ = ["ExportError", "PermanentExportError"]
+
+
+class ExportError(Exception):
+    """An export attempt failed and may be retried."""
+
+
+class PermanentExportError(ExportError):
+    """An export failed in a way retrying cannot fix (e.g. HTTP 400, gRPC INVALID_ARGUMENT)."""

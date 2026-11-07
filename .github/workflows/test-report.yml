@@ -1,0 +1,161 @@
+name: Test Report
+
+# Runs the unit and e2e suites once under coverage on Python 3.14, enforces the
+# aggregate coverage gate, and keeps a single PR comment (marker
+# `<!-- pyrock-test-report -->`) up to date. The full interpreter/OS matrix
+# lives in ci.yml; this workflow only reports.
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: test-report-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  UV_VERSION: "0.11.32"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  report:
+    name: Test & Coverage report
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Tests execute pull-request code; do not leave the comment-capable
+          # token in the checkout's git configuration.
+          persist-credentials: false
+
+      # Same pin as ci.yml (major tag); see the PR notes before pinning to a SHA.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.14"
+          enable-cache: true
+
+      - run: uv sync --group dev
+
+      - name: Validate report rendering
+        run: |
+          uv run mypy --strict scripts
+          uv run pytest scripts/tests -q -p no:cacheprovider
+
+      - name: Run unit tests
+        id: unit
+        run: |
+          set +e
+          uv run coverage run --branch --data-file=.coverage.unit -m pytest \
+            tests/unit tests/structure tests/support \
+            --junitxml=unit.xml -p no:cacheprovider 2>&1 | tee unit.log
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          # `coverage json` applies fail_under too; the gate is a separate step.
+          uv run coverage json --data-file=.coverage.unit -o coverage-unit.json --fail-under=0 -q
+          exit 0
+
+      - name: Run e2e tests
+        id: e2e
+        run: |
+          set +e
+          uv run coverage run --branch --data-file=.coverage.e2e -m pytest \
+            tests/e2e \
+            --junitxml=e2e.xml -p no:cacheprovider 2>&1 | tee e2e.log
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          uv run coverage json --data-file=.coverage.e2e -o coverage-e2e.json --fail-under=0 -q
+          echo "python=$(uv run python -c 'import platform; print(platform.python_version())')" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # Same gate as ci.yml: fail_under in pyproject.toml over both suites combined.
+      - name: Check aggregate coverage
+        id: coverage
+        run: |
+          set +e
+          uv run coverage combine --keep --data-file=.coverage .coverage.unit .coverage.e2e
+          status=$?
+          if (( status == 0 )); then
+            uv run coverage report --data-file=.coverage > coverage.txt 2>&1
+            status=$?
+            uv run coverage json --data-file=.coverage -o coverage.json --fail-under=0 -q
+          fi
+          cat coverage.txt 2>/dev/null
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Render report
+        if: always()
+        env:
+          UNIT_EXIT: ${{ steps.unit.outputs.exit_code }}
+          E2E_EXIT: ${{ steps.e2e.outputs.exit_code }}
+          COVERAGE_EXIT: ${{ steps.coverage.outputs.exit_code }}
+          REPORT_PYTHON: ${{ steps.e2e.outputs.python }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CHECKS_URL: ${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}/checks
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          uv run python scripts/test_report.py \
+            --unit unit.xml --unit-cov coverage-unit.json --unit-exit "$UNIT_EXIT" --unit-log unit.log \
+            --e2e e2e.xml --e2e-cov coverage-e2e.json --e2e-exit "$E2E_EXIT" --e2e-log e2e.log \
+            --total-cov coverage.json --coverage-exit "$COVERAGE_EXIT" \
+            --run-url "$RUN_URL" --checks-url "$CHECKS_URL" \
+            --sha "$HEAD_SHA" --python "$REPORT_PYTHON" \
+            --output report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # same pin as bedrock
+        with:
+          name: test-report
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            unit.xml
+            e2e.xml
+            unit.log
+            e2e.log
+            coverage-unit.json
+            coverage-e2e.json
+            coverage.json
+            coverage.txt
+            report.md
+
+      - name: Post test report comment
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        # Fork pull requests receive a read-only token. Reporting must not mask
+        # the authoritative test/coverage gate when commenting is unavailable.
+        continue-on-error: true
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- pyrock-test-report -->';
+            if (!fs.existsSync('report.md')) {
+              core.warning('report.md was not rendered; skipping the PR comment.');
+              return;
+            }
+            const body = fs.readFileSync('report.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c => (c.body ?? '').startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      # Fail the job after the comment is posted so the PR is blocked.
+      - name: Enforce tests and coverage
+        if: steps.unit.outputs.exit_code != '0' || steps.e2e.outputs.exit_code != '0' || steps.coverage.outputs.exit_code != '0'
+        run: |
+          echo "Unit tests, e2e tests, or the coverage gate failed; see the PR comment for details."
+          exit 1
