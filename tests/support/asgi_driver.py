@@ -254,7 +254,7 @@ async def call_websocket(
 ) -> WebSocketResult:
     """Connect, deliver ``incoming`` frames once accepted, then disconnect."""
     sc = make_scope(
-        "GET", path, headers=headers, scope_type="websocket", scheme="ws", **scope_kwargs
+        "GET", path, headers=headers, scope_type="websocket", **{"scheme": "ws", **scope_kwargs}
     )
     frames: list[dict[str, Any]] = []
     for item in incoming:

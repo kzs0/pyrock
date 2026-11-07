@@ -513,3 +513,24 @@ Tests that need an empty context run their thread target through
     `prometheus.encode(b.metrics)`.
 - **Performance to revisit in Phase 4:** an active operation's enter/exit
   costs about 11 µs, against about 0.5 µs on the noop path.
+
+## Phase 3 complete
+
+On the shared environment, the full suite passes: 3,220 passed, 26 skipped
+(the compat tests). `ruff` and strict `mypy` are clean.
+
+Carried into Phase 4 review:
+
+- **Shared HTTP instrumentation:** it lives in `wsgi.py`, so `asgi` and
+  `http` import `wsgi`. Move it to a private `_httpcore.py` with its own
+  boundary rule.
+- **Active operation cost:** enter and exit take about 11 µs. Profile and
+  trim it.
+- **Coverage gaps:** `_bedrock` is at 81% and `_envdetect` at 78%.
+- **Uncovered HTTP limitations:** a span on a plain urllib opener is never
+  ended if the request fails before a response; `wsgi.file_wrapper` is
+  bypassed. Document both.
+- **Features cut in `server` for coverage:** `100 Continue` and the
+  double-`start_response` error. Revisit them.
+- **Docs:** README, CHANGELOG and DESIGN deviations (profile, numbering,
+  samplers, the thread-context amendment).
