@@ -24,21 +24,21 @@ blocks: the middleware only wraps ``send`` and awaits the app.
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import weakref
 from collections.abc import Callable, Container, Iterable, Mapping
 from typing import TYPE_CHECKING
 
+from pyrock._httpcore import ROUTE_KEY, Instrumentation, RequestInfo
 from pyrock._types import ASGIApp, ASGIMessage, ASGIReceive, ASGIScope, ASGISend
-from pyrock.attr import AttrValue
-from pyrock.wsgi import Instrumentation, RequestInfo
 
 if TYPE_CHECKING:
     from pyrock._bedrock import Bedrock
     from pyrock._operation import Operation
+    from pyrock.attr import AttrValue
 
 __all__ = ["ROUTE_KEY", "Middleware"]
-
-ROUTE_KEY = "pyrock.route"
-"""Scope key a framework hook may set to the matched route template."""
 
 HTTP_OPERATION = "http.request"
 WEBSOCKET_OPERATION = "http.websocket"
@@ -47,7 +47,14 @@ WEBSOCKET_OPERATION = "http.websocket"
 class Middleware:
     """Wraps an ASGI app with an operation per HTTP request (and optionally websocket)."""
 
-    __slots__ = ("_app", "_instrumentation", "_operation_name", "_websocket", "_websocket_labels")
+    __slots__ = (
+        "_app",
+        "_instrumentation",
+        "_operation_name",
+        "_tracked",
+        "_tracked_lock",
+        "_websocket",
+    )
 
     def __init__(
         self,
@@ -69,7 +76,13 @@ class Middleware:
         websocket operations ``"http.websocket"``; an explicit name is used for
         both. With ``websocket=True`` each connection is one ``SERVER``
         operation with ``http.route`` and ``http.scheme`` (``ws``/``wss``); it
-        ends when the connection closes.
+        ends when the connection closes. Websocket operations use the same
+        metric labels as HTTP requests, with ``"_"`` for ``http_method`` and
+        ``http_status_code``, so a shared ``operation_name`` keeps one schema.
+
+        The running event loop is passed to the instance's ``track_loop`` once
+        per loop (on lifespan startup and on the first traced request), so
+        asyncio task metrics and profiles cover it.
 
         The instance is captured when the middleware is constructed: ``bedrock`` if given, else
         ``pyrock.current()`` at that point. If that is the noop, ``current()`` is
@@ -91,25 +104,53 @@ class Middleware:
             route=route,
             bedrock=bedrock,
         )
-        # A connection has no method or status, so websocket metrics omit those labels.
-        self._websocket_labels = tuple(
-            label
-            for label in self._instrumentation.labels
-            if label not in ("http.method", "http.status_code")
+        # The instance each loop was last tracked with (loops are held weakly).
+        self._tracked: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Bedrock] = (
+            weakref.WeakKeyDictionary()
         )
+        self._tracked_lock = threading.Lock()
 
     async def __call__(self, scope: ASGIScope, receive: ASGIReceive, send: ASGISend) -> None:
         kind = scope.get("type")
+        if kind == "lifespan":
+            await self._app(scope, self._lifespan_receive(receive), send)
+            return
         traced = kind == "http" or (kind == "websocket" and self._websocket)
         bedrock = self._instrumentation.instance() if traced else None
         if bedrock is None or bedrock.is_noop:
             await self._app(scope, receive, send)
-        elif kind == "http":
+            return
+        self._track_running_loop(bedrock)
+        if kind == "http":
             await _HTTPExchange(self._instrumentation, scope).run(
                 self._app, bedrock, self._operation_name or HTTP_OPERATION, receive, send
             )
         else:
             await self._websocket_connection(bedrock, scope, receive, send)
+
+    def _lifespan_receive(self, receive: ASGIReceive) -> ASGIReceive:
+        """Wrap ``receive`` to track the loop when ``lifespan.startup`` arrives."""
+
+        async def lifespan_receive() -> ASGIMessage:
+            message = await receive()
+            if message.get("type") == "lifespan.startup":
+                bedrock = self._instrumentation.instance()
+                if not bedrock.is_noop:
+                    self._track_running_loop(bedrock)
+            return message
+
+        return lifespan_receive
+
+    def _track_running_loop(self, bedrock: Bedrock) -> None:
+        """Call ``bedrock.track_loop`` for the running loop, once per (loop, instance)."""
+        loop = asyncio.get_running_loop()
+        if self._tracked.get(loop) is bedrock:
+            return
+        with self._tracked_lock:
+            if self._tracked.get(loop) is bedrock:
+                return
+            bedrock.track_loop(loop)
+            self._tracked[loop] = bedrock
 
     async def _websocket_connection(
         self, bedrock: Bedrock, scope: ASGIScope, receive: ASGIReceive, send: ASGISend
@@ -121,7 +162,6 @@ class Middleware:
             self._operation_name or WEBSOCKET_OPERATION,
             scope,
             _scope_info(scope),
-            labels=self._websocket_labels,
         )
         activation = op.activate()
         error: BaseException | None = None
@@ -139,16 +179,18 @@ class Middleware:
                 op.deactivate(activation)
 
 
-def _header(scope: ASGIScope, name: bytes) -> str | None:
-    """The first value of header ``name`` (lowercase) in the scope, decoded as latin-1."""
-    for key, value in scope.get("headers", ()):
-        if bytes(key).lower() == name:
-            return bytes(value).decode("latin-1")
-    return None
-
-
 def _scope_info(scope: ASGIScope) -> RequestInfo:
-    host = _header(scope, b"host")
+    """Request details from one pass over the scope's headers (which are not copied)."""
+    headers = scope.get("headers", ())
+    host: str | None = None
+    agent: str | None = None
+    for key, value in headers:
+        name = bytes(key).lower()
+        if name == b"host":
+            if host is None:
+                host = bytes(value).decode("latin-1")
+        elif name == b"user-agent" and agent is None:
+            agent = bytes(value).decode("latin-1")
     if host is None:
         server = scope.get("server")
         host = f"{server[0]}:{server[1]}" if server else ""
@@ -157,8 +199,8 @@ def _scope_info(scope: ASGIScope) -> RequestInfo:
         method=None if websocket else str(scope.get("method", "GET")),
         scheme=str(scope.get("scheme", "ws" if websocket else "http")),
         host=host,
-        user_agent=_header(scope, b"user-agent"),
-        headers=[(bytes(k), bytes(v)) for k, v in scope.get("headers", ())],
+        user_agent=agent,
+        headers=headers,
     )
 
 

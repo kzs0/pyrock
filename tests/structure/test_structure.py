@@ -158,6 +158,7 @@ LAZY_MODULES = (
     "pyrock.asgi",
     "pyrock.server",
     "pyrock.http",
+    "pyrock._httpcore",
     "pyrock.testing",
 )
 HEAVY_STDLIB = ("asyncio", "ssl", "http.server", "urllib.request", "tracemalloc", "subprocess")

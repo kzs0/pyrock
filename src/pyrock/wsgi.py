@@ -27,186 +27,27 @@ closed inside that same context, so streaming generators see the operation
 too. The middleware wraps the response iterable, so a server's
 ``wsgi.file_wrapper`` fast path is not used for instrumented responses.
 
-This module also holds the request-instrumentation core shared with
-:mod:`pyrock.asgi` and :func:`pyrock.http.instrument_http_server`.
+``route=`` and ``additional_attrs=`` callbacks that raise are logged once
+on the ``pyrock`` logger and fall back (to ``environ[ROUTE_KEY]`` / no extra
+attributes); the request itself is never failed by them.
 """
 
 from __future__ import annotations
 
 import contextvars
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sized
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING
 
-from pyrock._bedrock import current
+from pyrock._httpcore import ROUTE_KEY, Instrumentation, RequestInfo, parse_status
 from pyrock._types import ExcInfo, StartResponse, WSGIApp, WSGIEnviron
-from pyrock.attr import AttrValue
-from pyrock.trace import SpanKind
-from pyrock.trace.http import HeaderCarrier, HTTPPropagator, WSGIEnvironHeaders
+from pyrock.trace.http import WSGIEnvironHeaders
 
 if TYPE_CHECKING:
     from pyrock._bedrock import Bedrock
     from pyrock._operation import Operation
+    from pyrock.attr import AttrValue
 
 __all__ = ["ROUTE_KEY", "Middleware"]
-
-ROUTE_KEY = "pyrock.route"
-"""``environ`` key a framework hook may set to the matched route template."""
-
-UNMATCHED_ROUTE = "_"
-"""``http.route`` when no template is known (shared by every unmatched path)."""
-
-INTERNAL_ERROR = 500
-"""``http.status_code`` recorded when the app fails before sending a response."""
-
-DEFAULT_LABELS = ("http.method", "http.route", "http.status_code")
-
-_PROPAGATOR = HTTPPropagator()
-
-RequestT = TypeVar("RequestT")
-
-
-@dataclass(frozen=True, slots=True)
-class RequestInfo:
-    """What a server integration extracted from one incoming request."""
-
-    method: str | None
-    """``None`` for requests without one (websocket connections)."""
-    scheme: str
-    host: str
-    user_agent: str | None
-    headers: HeaderCarrier
-
-
-class Instrumentation(Generic[RequestT]):
-    """Request instrumentation shared by the WSGI, ASGI and ``http.server`` integrations.
-
-    ``RequestT`` is what user callbacks receive: the WSGI ``environ``, the
-    ASGI ``scope`` or the ``BaseHTTPRequestHandler``. Immutable after
-    construction, so one instance serves concurrent requests.
-    """
-
-    __slots__ = (
-        "_additional_attrs",
-        "_bedrock",
-        "_labels",
-        "_route",
-        "_success_codes",
-        "_trace_propagation",
-    )
-
-    def __init__(
-        self,
-        *,
-        additional_labels: Iterable[str],
-        additional_attrs: Callable[[RequestT], Mapping[str, AttrValue]] | None,
-        success_codes: Container[int] | None,
-        trace_propagation: bool,
-        route: Callable[[RequestT], str | None] | None,
-        bedrock: Bedrock | None,
-    ) -> None:
-        if bedrock is None:
-            active = current()
-            bedrock = None if active.is_noop else active
-        self._bedrock = bedrock
-        self._labels = tuple(dict.fromkeys((*DEFAULT_LABELS, *additional_labels)))
-        self._additional_attrs = additional_attrs
-        self._success_codes = success_codes
-        self._trace_propagation = trace_propagation
-        self._route = route
-
-    @property
-    def labels(self) -> tuple[str, ...]:
-        """Metric labels: the defaults plus ``additional_labels``."""
-        return self._labels
-
-    def instance(self) -> Bedrock:
-        """The instance captured at construction, else the active one (maybe the noop)."""
-        return current() if self._bedrock is None else self._bedrock
-
-    def start(
-        self,
-        bedrock: Bedrock,
-        name: str,
-        request: RequestT,
-        info: RequestInfo,
-        *,
-        labels: tuple[str, ...] | None = None,
-    ) -> Operation:
-        """Start (without activating) the ``SERVER`` operation for one request."""
-        attrs: dict[str, AttrValue] = {"http.scheme": info.scheme, "http.host": info.host}
-        if info.method is not None:
-            attrs["http.method"] = info.method
-        agent = info.user_agent
-        if agent and bedrock.policy.value("http.user_agent", agent)[1]:
-            attrs["http.user_agent"] = agent
-        if self._additional_attrs is not None:
-            attrs.update(self._additional_attrs(request))
-        remote = _PROPAGATOR.extract(info.headers) if self._trace_propagation else None
-        return bedrock.start_operation(
-            name,
-            attrs=attrs,
-            metric_labels=self._labels if labels is None else labels,
-            remote_parent=remote,
-            kind=SpanKind.SERVER,
-        )
-
-    def finish(
-        self,
-        op: Operation,
-        request: RequestT,
-        *,
-        framework_route: str | None,
-        status: int | None,
-        error: BaseException | None,
-    ) -> None:
-        """Record the route and outcome, then end ``op``.
-
-        ``status=None`` means the response never started, recorded as ``500``
-        whether or not an exception escaped.
-        """
-        recorded = INTERNAL_ERROR if status is None else status
-        op.register(
-            {
-                "http.route": self.route_of(request, framework_route),
-                "http.status_code": recorded,
-            }
-        )
-        if error is None and not self.is_success(recorded):
-            op.fail()
-        op.end(error=error)
-
-    def finish_connection(
-        self,
-        op: Operation,
-        request: RequestT,
-        *,
-        framework_route: str | None,
-        error: BaseException | None,
-    ) -> None:
-        """End a status-less operation (a websocket connection): failure only on ``error``."""
-        op.register({"http.route": self.route_of(request, framework_route)})
-        op.end(error=error)
-
-    def route_of(self, request: RequestT, framework_route: str | None) -> str:
-        """The ``route=`` callable's template, else the framework's, else ``"_"``."""
-        if self._route is not None:
-            template = self._route(request)
-            if template is not None:
-                return template
-        return UNMATCHED_ROUTE if framework_route is None else framework_route
-
-    def is_success(self, status: int) -> bool:
-        """Whether ``status`` counts as success (``success_codes``, else below 400)."""
-        if self._success_codes is None:
-            return status < 400
-        return status in self._success_codes
-
-
-def parse_status(status: str) -> int | None:
-    """The numeric code of a WSGI status line such as ``"404 Not Found"``."""
-    code = status.partition(" ")[0]
-    return int(code) if code.isdigit() else None
 
 
 class Middleware:

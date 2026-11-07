@@ -26,27 +26,28 @@ from __future__ import annotations
 import contextvars
 import functools
 import http.client
-import http.server
 import json as _json
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 import weakref
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Container, Iterable, Mapping
 from email.message import Message
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, cast
 
 from pyrock._bedrock import current, current_span_context, inject_headers
 from pyrock._context import no_trace_var
+from pyrock._httpcore import Instrumentation, RequestInfo
 from pyrock.attr import AttrValue
 from pyrock.privacy import sanitize_url
 from pyrock.trace import Span, SpanKind, StatusCode
 from pyrock.trace.w3c import TRACESTATE_HEADER
-from pyrock.wsgi import Instrumentation, RequestInfo
 
 if TYPE_CHECKING:
+    from http.server import BaseHTTPRequestHandler
+
     from pyrock._bedrock import Bedrock
     from pyrock._operation import Operation
     from pyrock.privacy import Policy
@@ -62,7 +63,7 @@ __all__ = [
     "request",
 ]
 
-HandlerT = TypeVar("HandlerT", bound=type[http.server.BaseHTTPRequestHandler])
+HandlerT = TypeVar("HandlerT", bound="type[BaseHTTPRequestHandler]")
 
 _RawResponse = http.client.HTTPResponse | urllib.error.HTTPError
 
@@ -381,65 +382,73 @@ def post(
 # ---------------------------------------------------------------------- server
 
 
-class _TracedRequestHandler(http.server.BaseHTTPRequestHandler):
-    """Mixin placed before the user's handler class by :func:`instrument_http_server`."""
+@functools.cache
+def _traced_mixin() -> type[BaseHTTPRequestHandler]:
+    """The mixin :func:`instrument_http_server` places before the user's handler class.
 
-    _pyrock_instrumentation: ClassVar[Instrumentation[http.server.BaseHTTPRequestHandler]]
-    _pyrock_operation_name: ClassVar[str]
-    _pyrock_op: Operation | None = None
-    _pyrock_status: int | None = None
+    Built on first use so that importing this module does not import ``http.server``.
+    """
+    import http.server
 
-    def handle_one_request(self) -> None:
-        """Handle one request in its own context (keep-alive connections loop over this)."""
-        contextvars.copy_context().run(self._pyrock_handle_one_request)
+    class _TracedRequestHandler(http.server.BaseHTTPRequestHandler):
+        _pyrock_instrumentation: ClassVar[Instrumentation[BaseHTTPRequestHandler]]
+        _pyrock_operation_name: ClassVar[str]
+        _pyrock_op: Operation | None = None
+        _pyrock_status: int | None = None
 
-    def _pyrock_handle_one_request(self) -> None:
-        self._pyrock_op = None
-        self._pyrock_status = None
-        try:
-            super().handle_one_request()
-        except BaseException as exc:
-            self._pyrock_finish(exc)
-            raise
-        self._pyrock_finish(None)
+        def handle_one_request(self) -> None:
+            """Handle one request in its own context (keep-alive connections loop over this)."""
+            contextvars.copy_context().run(self._pyrock_handle_one_request)
 
-    def parse_request(self) -> bool:
-        """Parse as usual, then start and activate the request's operation."""
-        if not super().parse_request():
-            return False
-        bedrock = self._pyrock_instrumentation.instance()
-        if not bedrock.is_noop:
-            op = self._pyrock_instrumentation.start(
-                bedrock, self._pyrock_operation_name, self, self._pyrock_info()
+        def _pyrock_handle_one_request(self) -> None:
+            self._pyrock_op = None
+            self._pyrock_status = None
+            try:
+                super().handle_one_request()
+            except BaseException as exc:
+                self._pyrock_finish(exc)
+                raise
+            self._pyrock_finish(None)
+
+        def parse_request(self) -> bool:
+            """Parse as usual, then start and activate the request's operation."""
+            if not super().parse_request():
+                return False
+            bedrock = self._pyrock_instrumentation.instance()
+            if not bedrock.is_noop:
+                op = self._pyrock_instrumentation.start(
+                    bedrock, self._pyrock_operation_name, self, self._pyrock_info()
+                )
+                # The context is private to this request, so the activation is never undone.
+                op.activate()
+                self._pyrock_op = op
+            return True
+
+        def send_response_only(self, code: int, message: str | None = None) -> None:
+            super().send_response_only(code, message)
+            if code >= 200:
+                self._pyrock_status = code
+
+        def _pyrock_info(self) -> RequestInfo:
+            host = self.headers.get("Host") or "{}:{}".format(*self.connection.getsockname()[:2])
+            return RequestInfo(
+                method=self.command,
+                scheme="https" if hasattr(self.connection, "getpeercert") else "http",
+                host=host,
+                user_agent=self.headers.get("User-Agent"),
+                headers=self.headers.items(),
             )
-            # The context is private to this request, so the activation is never undone.
-            op.activate()
-            self._pyrock_op = op
-        return True
 
-    def send_response_only(self, code: int, message: str | None = None) -> None:
-        super().send_response_only(code, message)
-        if code >= 200:
-            self._pyrock_status = code
+        def _pyrock_finish(self, error: BaseException | None) -> None:
+            op = self._pyrock_op
+            if op is None:
+                return
+            self._pyrock_op = None
+            self._pyrock_instrumentation.finish(
+                op, self, framework_route=None, status=self._pyrock_status, error=error
+            )
 
-    def _pyrock_info(self) -> RequestInfo:
-        host = self.headers.get("Host") or "{}:{}".format(*self.connection.getsockname()[:2])
-        return RequestInfo(
-            method=self.command,
-            scheme="https" if hasattr(self.connection, "getpeercert") else "http",
-            host=host,
-            user_agent=self.headers.get("User-Agent"),
-            headers=self.headers.items(),
-        )
-
-    def _pyrock_finish(self, error: BaseException | None) -> None:
-        op = self._pyrock_op
-        if op is None:
-            return
-        self._pyrock_op = None
-        self._pyrock_instrumentation.finish(
-            op, self, framework_route=None, status=self._pyrock_status, error=error
-        )
+    return _TracedRequestHandler
 
 
 def instrument_http_server(
@@ -447,10 +456,21 @@ def instrument_http_server(
     /,
     *,
     operation_name: str = "http.request",
-    route: Callable[[http.server.BaseHTTPRequestHandler], str | None] | None = None,
+    additional_labels: Iterable[str] = (),
+    additional_attrs: Callable[[BaseHTTPRequestHandler], Mapping[str, AttrValue]] | None = None,
+    success_codes: Container[int] | None = None,
+    trace_propagation: bool = True,
+    route: Callable[[BaseHTTPRequestHandler], str | None] | None = None,
     bedrock: Bedrock | None = None,
 ) -> HandlerT:
     """Return a subclass of a ``BaseHTTPRequestHandler`` that traces each request.
+
+    The options mean what they mean on :class:`pyrock.wsgi.Middleware`:
+    ``additional_labels`` extends the metric labels, ``additional_attrs``
+    receives the handler (after the request line and headers are parsed) and
+    returns extra attributes, ``success_codes=None`` treats every status below
+    400 as success, and ``trace_propagation=False`` ignores incoming
+    ``traceparent``/``tracestate`` headers.
 
     The instance is captured when this function is called: ``bedrock`` if given, else
     ``pyrock.current()`` at that point. If that is the noop, ``current()`` is
@@ -460,14 +480,16 @@ def instrument_http_server(
 
     ``route`` receives the handler (after the request line and headers are
     parsed); without it, or when it returns ``None``, ``http.route`` is ``"_"``.
-    The final status is the last non-1xx status sent; an exception from the
-    handler marks failure (``500`` if no status was sent) and is re-raised.
+    ``route`` and ``additional_attrs`` callbacks that raise are logged once on
+    the ``pyrock`` logger and fall back. The final status is the last non-1xx
+    status sent; an exception from the handler marks failure (``500`` if no
+    status was sent) and is re-raised.
     """
-    instrumentation: Instrumentation[http.server.BaseHTTPRequestHandler] = Instrumentation(
-        additional_labels=(),
-        additional_attrs=None,
-        success_codes=None,
-        trace_propagation=True,
+    instrumentation: Instrumentation[BaseHTTPRequestHandler] = Instrumentation(
+        additional_labels=additional_labels,
+        additional_attrs=additional_attrs,
+        success_codes=success_codes,
+        trace_propagation=trace_propagation,
         route=route,
         bedrock=bedrock,
     )
@@ -478,5 +500,5 @@ def instrument_http_server(
         "_pyrock_instrumentation": instrumentation,
         "_pyrock_operation_name": operation_name,
     }
-    traced = type(handler_class.__name__, (_TracedRequestHandler, handler_class), namespace)
+    traced = type(handler_class.__name__, (_traced_mixin(), handler_class), namespace)
     return cast("HandlerT", traced)
