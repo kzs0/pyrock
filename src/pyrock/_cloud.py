@@ -6,9 +6,12 @@
 
 * Traces: OTLP/gRPC with ``x-bedrock-key`` metadata; a larger batch processor.
   The target is ``traces_endpoint`` when set, otherwise derived from
-  ``endpoint``; either may be ``host:port`` or a URL (see
-  :func:`grpc_endpoint`). The connection uses h2c when ``insecure`` is set or
-  the target is an ``http://`` URL, TLS otherwise.
+  ``endpoint``; either may be ``host:port`` or a URL, parsed by
+  :func:`pyrock.trace.otlp.grpc.parse_target` (see :func:`grpc_endpoint`).
+  The connection uses h2c when ``insecure`` is set or the target is an
+  ``http://`` URL, TLS otherwise. Because the API key travels with every
+  request, an ``http://`` ``endpoint`` or ``traces_endpoint`` is rejected
+  unless ``insecure=True``.
 * :class:`RetryExporter`: one initial attempt plus one retry per
   ``retry_backoff`` entry (default ``(1, 2, 4)`` s: 4 calls in all, as in Go),
   waiting on an event so shutdown interrupts the back-off at once.
@@ -36,8 +39,11 @@ import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
-from pyrock._compat import is_nonempty_str, is_positive_number, seconds
+from pyrock._compat import ConfigError, is_nonempty_str, is_positive_number, seconds
+from pyrock._transport import forward_fork, remaining
+from pyrock.privacy import sanitize_url
 from pyrock.profile import DEFAULT_PROFILE_TYPES, ProfileExportConfig, ProfileType
 from pyrock.trace import Span, SpanExporter
 from pyrock.trace.otlp import ExportError, PermanentExportError
@@ -62,8 +68,6 @@ DEFAULT_ENDPOINT = "https://ingest.bedrock.dev"
 API_KEY_HEADER = "x-bedrock-key"
 DEFAULT_RETRY_BACKOFF: tuple[float, ...] = (1.0, 2.0, 4.0)
 MAX_RETRY_BACKOFF_ENTRIES = 10
-DEFAULT_GRPC_PORT = 4317
-"""Added to a gRPC target that names no port, as in Go's ``cloudGRPCEndpoint``."""
 
 CLOUD_MAX_QUEUE_SIZE = 10_000
 """Queue of the cloud batch processor (Go: 10000, against 2048 locally)."""
@@ -81,15 +85,17 @@ class CloudConfig:
     """Cloud settings. ``api_key`` is excluded from ``repr`` and equality.
 
     Durations are seconds (a :class:`datetime.timedelta` is converted).
-    Construction validates every field and raises ``ValueError`` listing
-    every problem.
+    Construction validates every field and raises
+    :class:`~pyrock.ConfigError` (a ``ValueError``) listing every problem.
     """
 
     api_key: str = field(repr=False, compare=False)
     endpoint: str = DEFAULT_ENDPOINT
-    """Base URL for metrics and profile pushes (and traces, unless ``traces_endpoint``)."""
+    """Base ``http(s)`` URL for metrics and profile pushes (and traces, unless
+    ``traces_endpoint``). ``http://`` requires ``insecure=True``."""
     insecure: bool = False
-    """Plaintext h2c for traces and allow ``http://`` profile pushes (local development)."""
+    """Plaintext h2c for traces and allow ``http://`` endpoints (local development only:
+    the API key is then sent unencrypted)."""
     push_interval: float = 15.0
     profile_interval: float = 60.0
     profile_cpu_sample_duration: float = 10.0
@@ -105,7 +111,8 @@ class CloudConfig:
     traces_endpoint: str | None = None
     """Optional gRPC trace target (``host:port`` or a URL, normalized like Go).
 
-    ``None`` derives the target from :attr:`endpoint`.
+    ``None`` derives the target from :attr:`endpoint`. An ``http://`` URL
+    requires ``insecure=True``.
     """
 
     def __post_init__(self) -> None:
@@ -119,7 +126,7 @@ class CloudConfig:
             *self._interval_problems(),
         ]
         if problems:
-            raise ValueError("invalid CloudConfig: " + "; ".join(problems))
+            raise ConfigError(problems)
 
     def _normalize_profiles(self) -> list[str]:
         raw: object = self.profiles
@@ -156,9 +163,13 @@ class CloudConfig:
         problems: list[str] = []
         if not is_nonempty_str(self.endpoint):
             problems.append("endpoint must be a non-empty string")
+        else:
+            problems += _url_problems("endpoint", self.endpoint, insecure=self.insecure)
         traces: object = self.traces_endpoint
         if traces is not None and not is_nonempty_str(traces):
             problems.append("traces_endpoint must be a non-empty string or None")
+        elif isinstance(traces, str):
+            problems += _target_problems("traces_endpoint", traces, insecure=self.insecure)
         return problems
 
     def _interval_problems(self) -> list[str]:
@@ -173,6 +184,43 @@ class CloudConfig:
         ):
             problems.append("profile_cpu_sample_duration must be > 0 and < profile_interval")
         return problems
+
+
+def _url_problems(name: str, url: str, *, insecure: bool) -> list[str]:
+    """``endpoint`` is the base of the push URLs: an absolute ``http(s)`` URL."""
+    shown = sanitize_url(url)
+    try:
+        parts = urlsplit(url)
+        valid = parts.scheme in ("http", "https") and bool(parts.hostname)
+    except ValueError:
+        valid = False
+    if not valid:
+        return [f"{name} must be an http(s) URL: {shown!r}"]
+    if parts.username is not None or parts.password is not None:
+        return [f"{name} must not contain credentials: {shown!r}"]
+    if parts.scheme == "http" and not insecure:
+        return [_plaintext_problem(name, shown)]
+    return []
+
+
+def _target_problems(name: str, target: str, *, insecure: bool) -> list[str]:
+    """``traces_endpoint`` is a gRPC target: ``host[:port]`` or an ``http(s)`` URL."""
+    from pyrock.trace.otlp.grpc import parse_target
+
+    try:
+        _, _, plaintext = parse_target(target)
+    except ValueError as exc:
+        return [f"{name}: {exc}"]
+    if plaintext and not insecure:
+        return [_plaintext_problem(name, sanitize_url(target))]
+    return []
+
+
+def _plaintext_problem(name: str, shown: str) -> str:
+    return (
+        f"{name} {shown!r} is plaintext http, which would send the API key unencrypted; "
+        "use https or set insecure=True"
+    )
 
 
 def _is_backoff(value: object) -> bool:
@@ -215,43 +263,16 @@ def grpc_endpoint(endpoint: str, /) -> str:
     any path, query or fragment, and port 4317 is added when none is given:
     ``https://ingest.bedrock.dev`` becomes ``ingest.bedrock.dev:4317``. A bare
     ``host:port`` is returned unchanged. IPv6 literals are written in brackets.
-    Used for both ``endpoint`` and ``traces_endpoint``; anything malformed is
-    rejected later by the gRPC exporter.
+    Parsing is :func:`pyrock.trace.otlp.grpc.parse_target`'s, so a malformed
+    target raises ``ValueError``.
     """
-    scheme, sep, rest = endpoint.partition("://")
-    if sep and scheme.lower() in ("http", "https"):
-        endpoint = rest
-    for delimiter in "/?#":
-        endpoint = endpoint.partition(delimiter)[0]
-    if not _has_port(endpoint):
-        endpoint += f":{DEFAULT_GRPC_PORT}"
-    return endpoint
+    from pyrock.trace.otlp.grpc import format_target, parse_target
 
-
-def _has_port(authority: str) -> bool:
-    if authority.startswith("["):  # [v6]:port
-        return ":" in authority.rpartition("]")[2]
-    return ":" in authority
-
-
-def _uses_plaintext(config: CloudConfig) -> bool:
-    """h2c when asked for, or when the trace target is an ``http://`` URL (as in Go)."""
-    target = config.traces_endpoint or config.endpoint
-    return config.insecure or target.lower().startswith("http://")
+    host, port, _ = parse_target(endpoint)
+    return format_target(host, port)
 
 
 # -- exporters ----------------------------------------------------------------
-
-
-def _forward_fork(exporter: object) -> None:
-    """Call ``exporter._after_fork_in_child()`` when it defines one."""
-    reset = getattr(exporter, "_after_fork_in_child", None)
-    if callable(reset):
-        reset()
-
-
-def _remaining(deadline: float | None) -> float | None:
-    return None if deadline is None else max(0.0, deadline - time.monotonic())
 
 
 class RetryExporter:
@@ -282,7 +303,7 @@ class RetryExporter:
         deadline = None if timeout is None else time.monotonic() + timeout
         for attempt, delay in enumerate((*self._backoff, None), start=1):
             try:
-                self._exporter.export(spans, timeout=_remaining(deadline))
+                self._exporter.export(spans, timeout=remaining(deadline))
             except PermanentExportError:
                 raise
             except ExportError as exc:
@@ -300,8 +321,8 @@ class RetryExporter:
 
     def _wait(self, delay: float, deadline: float | None) -> bool:
         """Back off for ``delay``; ``False`` if shut down or the deadline comes first."""
-        remaining = _remaining(deadline)
-        if remaining is not None and remaining < delay:
+        left = remaining(deadline)
+        if left is not None and left < delay:
             return False
         return not self._stopped.wait(delay)
 
@@ -316,7 +337,7 @@ class RetryExporter:
         if self._stopped.is_set():
             stopped.set()
         self._stopped = stopped
-        _forward_fork(self._exporter)
+        forward_fork(self._exporter)
 
 
 class FanOutExporter:
@@ -340,7 +361,7 @@ class FanOutExporter:
     def _after_fork_in_child(self) -> None:
         """Forward the fork hook to every exporter."""
         for exporter in self._exporters:
-            _forward_fork(exporter)
+            forward_fork(exporter)
 
 
 def _call_all(
@@ -353,7 +374,7 @@ def _call_all(
     first: Exception | None = None
     for exporter in exporters:
         try:
-            call(exporter, _remaining(deadline))
+            call(exporter, remaining(deadline))
         except Exception as exc:  # every exporter must be called, whatever the others do
             if first is None:
                 first = exc
@@ -369,19 +390,41 @@ class CloudWiring:
 
     Only the metrics pusher lives here: the trace pipeline belongs to the
     tracer and the profile exporter to the :class:`~pyrock.Bedrock`, which
-    stop and fork-reset them.
+    stop and fork-reset them. The wiring also remembers the trace exporters
+    so a forked child can give them the child's refreshed resource.
     """
 
-    def __init__(self, pusher: MetricsPusher, /) -> None:
+    def __init__(
+        self,
+        pusher: MetricsPusher,
+        /,
+        *,
+        bedrock: Bedrock | None = None,
+        exporters: Sequence[object] = (),
+    ) -> None:
         self._pusher = pusher
+        self._bedrock = bedrock
+        self._exporters = tuple(exporters)
 
     def stop(self, *, timeout: float | None = None) -> None:
         """Final metrics push and stop all cloud workers, bounded by ``timeout``."""
         self._pusher.stop(timeout=timeout)
 
     def _after_fork_in_child(self) -> None:
-        """Restart the metrics push in a forked child (called by the core fork hook)."""
+        """Restart the metrics push in a forked child (called by the core fork hook).
+
+        The core rebuilds its tracer (and so the resource, with the child's
+        ``process.pid``) before calling this; the trace exporters, which
+        copied the parent's resource, are handed the new one.
+        """
         self._pusher._after_fork_in_child()
+        if self._bedrock is None:
+            return
+        resource = self._bedrock.tracer.resource
+        for exporter in self._exporters:
+            replace = getattr(exporter, "_replace_resource", None)
+            if callable(replace):
+                replace(resource)
 
 
 def wire(bedrock: Bedrock, config: CloudConfig, /) -> CloudWiring:
@@ -394,11 +437,15 @@ def wire(bedrock: Bedrock, config: CloudConfig, /) -> CloudWiring:
     """
     from pyrock._push import MetricsPusher
 
-    exporter = _trace_exporter(bedrock, config)
+    exporter, leaves = _trace_exporter(bedrock, config)
     base = config.endpoint.rstrip("/")
     auth = {"Authorization": f"Bearer {config.api_key}"}
     pusher = MetricsPusher(
-        bedrock.metrics, endpoint=f"{base}/v1/metrics", headers=auth, interval=config.push_interval
+        bedrock.metrics,
+        endpoint=f"{base}/v1/metrics",
+        headers=auth,
+        interval=config.push_interval,
+        allow_http=config.insecure,
     )
     profiles = _profile_config(config, base, auth)
     bedrock.tracer.set_processor(
@@ -412,25 +459,29 @@ def wire(bedrock: Bedrock, config: CloudConfig, /) -> CloudWiring:
     if profiles is not None:
         bedrock.start_profile_export(profiles)
     pusher.start()
-    return CloudWiring(pusher)
+    return CloudWiring(pusher, bedrock=bedrock, exporters=leaves)
 
 
-def _trace_exporter(bedrock: Bedrock, config: CloudConfig) -> SpanExporter:
-    """The retrying gRPC exporter, fanned out with the local one when there is one."""
+def _trace_exporter(bedrock: Bedrock, config: CloudConfig) -> tuple[SpanExporter, list[object]]:
+    """The retrying gRPC exporter, fanned out with the local one when there is one.
+
+    Also returns the unwrapped exporters, whose resource a fork child refreshes.
+    """
     from pyrock.trace.otlp.grpc import GRPCExporter
 
     grpc = GRPCExporter(
-        grpc_endpoint(config.traces_endpoint or config.endpoint),
+        config.traces_endpoint or config.endpoint,
         service=bedrock.config.service,
         resource=bedrock.tracer.resource,
         headers={API_KEY_HEADER: config.api_key},
-        insecure=_uses_plaintext(config),
+        insecure=config.insecure,
     )
     cloud_exporter = RetryExporter(grpc, backoff=config.retry_backoff)
     processor = bedrock.tracer.processor
     if isinstance(processor, BatchProcessor):  # a local trace_url pipeline
-        return FanOutExporter(processor.exporter, cloud_exporter)
-    return cloud_exporter
+        local = processor.exporter
+        return FanOutExporter(local, cloud_exporter), [local, grpc]
+    return cloud_exporter, [grpc]
 
 
 def _profile_config(
@@ -448,6 +499,6 @@ def _profile_config(
             cpu_sample_duration=config.profile_cpu_sample_duration,
             allow_http=config.insecure,
         )
-    except ValueError as exc:
+    except ValueError as exc:  # its messages name settings, never header values
         _log.warning("cloud profile export disabled: %s", exc)
         return None

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import collections
+import contextlib
+import logging
 import threading
 import time
 from dataclasses import dataclass
 
+from pyrock._transport import forward_fork, remaining
 from pyrock.trace import Span, SpanExporter
+from pyrock.trace.otlp import ExportError
 
 __all__ = [
     "DEFAULT_EXPORT_TIMEOUT",
@@ -38,8 +42,10 @@ class BatchStats:
     """Spans currently queued."""
 
 
-def _remaining(deadline: float | None) -> float | None:
-    return None if deadline is None else max(0.0, deadline - time.monotonic())
+FAILURE_LOG_INTERVAL = 60.0
+"""Seconds between export-failure warnings after the first one."""
+
+_log = logging.getLogger("pyrock")
 
 
 class BatchProcessor:
@@ -51,6 +57,13 @@ class BatchProcessor:
     the previous batch, on :meth:`force_flush` and on :meth:`shutdown`. Each
     export call gets ``export_timeout``; an exception from the exporter counts
     as one failed call and never stops the worker.
+
+    Failures are also logged as a warning on the ``pyrock`` logger: the first
+    one at once, then at most one every :data:`FAILURE_LOG_INTERVAL` seconds
+    (with the number of failures since the last warning). The warning carries
+    the exception type, plus the message for an
+    :class:`~pyrock.trace.otlp.ExportError` (whose messages pyrock writes and
+    never include credentials); other exceptions' messages are not logged.
     """
 
     def __init__(
@@ -89,6 +102,8 @@ class BatchProcessor:
         self._exported = 0
         self._dropped = 0
         self._failed = 0
+        self._last_failure_log: float | None = None
+        self._unlogged_failures = 0
 
     @property
     def exporter(self) -> SpanExporter:
@@ -136,10 +151,10 @@ class BatchProcessor:
             self._work.notify()
             worker = self._worker
         if worker is not None:
-            worker.join(_remaining(deadline))
+            worker.join(remaining(deadline))
         with self._work:
             self._locked_discard_queue()
-        self._exporter.shutdown(timeout=_remaining(deadline))
+        self._exporter.shutdown(timeout=remaining(deadline))
 
     def stats(self) -> BatchStats:
         """A consistent snapshot of the counters."""
@@ -154,9 +169,7 @@ class BatchProcessor:
         when it has one, so it never reuses the parent's connection.
         """
         self._reset()
-        reset_exporter = getattr(self._exporter, "_after_fork_in_child", None)
-        if callable(reset_exporter):
-            reset_exporter()
+        forward_fork(self._exporter)
 
     # -- worker (all helpers named _locked_* run with the lock held) --------
 
@@ -205,19 +218,33 @@ class BatchProcessor:
         )
 
     def _export(self, batch: list[Span]) -> None:
+        error: Exception | None = None
         try:
             self._exporter.export(batch, timeout=self._export_timeout)
-        except Exception:  # counted; the worker must survive any exporter failure
-            ok = False
-        else:
-            ok = True
+        except Exception as exc:  # counted; the worker must survive any exporter failure
+            error = exc
+        report = 0
         with self._work:
-            if ok:
+            if error is None:
                 self._exported += len(batch)
             else:
                 self._failed += 1
+                report = self._locked_failure_report()
             self._completed += len(batch)
             self._done.notify_all()
+        if error is not None and report:
+            _log_failure(error, report, len(batch))
+
+    def _locked_failure_report(self) -> int:
+        """Failures to report now (this one included), or 0 while rate-limited."""
+        self._unlogged_failures += 1
+        now = time.monotonic()
+        last = self._last_failure_log
+        if last is not None and now - last < FAILURE_LOG_INTERVAL:
+            return 0
+        self._last_failure_log = now
+        count, self._unlogged_failures = self._unlogged_failures, 0
+        return count
 
     def _locked_discard_queue(self) -> None:
         """Drop what a timed-out shutdown left queued, releasing flush waiters."""
@@ -228,3 +255,18 @@ class BatchProcessor:
             self._taken += left
             self._completed += left
             self._done.notify_all()
+
+
+def _log_failure(error: Exception, failures: int, spans: int) -> None:
+    """Warn about failed exports without leaking anything an exception might carry."""
+    detail = type(error).__name__
+    if isinstance(error, ExportError) and str(error):
+        detail = f"{detail}: {error}"
+    with contextlib.suppress(Exception):  # logging must never break the export worker
+        _log.warning(
+            "trace export failed, %d span(s) dropped: %s"
+            " (%d failed export(s) since the last warning)",
+            spans,
+            detail,
+            failures,
+        )

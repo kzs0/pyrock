@@ -11,13 +11,14 @@ from __future__ import annotations
 import base64
 import json
 import math
-import re
 import threading
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-from pyrock._version import __version__
+from pyrock._transport import header_problems, no_redirect_opener
+from pyrock._version import SCOPE_NAME, __version__
 from pyrock.attr import AttrValue
+from pyrock.privacy import sanitize_url
 from pyrock.trace import Span, SpanEvent, StatusCode
 from pyrock.trace.otlp import ExportError, PermanentExportError
 from pyrock.trace.otlp._pb import (
@@ -33,7 +34,6 @@ if TYPE_CHECKING:
 
 __all__ = ["HTTPExporter", "encode_json", "to_otlp_json"]
 
-_SCOPE_NAME = "pyrock"
 _NON_FINITE = {math.inf: "Infinity", -math.inf: "-Infinity"}
 
 
@@ -109,7 +109,7 @@ def to_otlp_json(
     resource_obj: dict[str, Any] = {}
     _attributes(resource_obj, resource_attributes(service, resource))
     scope_spans = {
-        "scope": {"name": _SCOPE_NAME, "version": __version__},
+        "scope": {"name": SCOPE_NAME, "version": __version__},
         "spans": [_span(span) for span in spans],
     }
     return {"resourceSpans": [{"resource": resource_obj, "scopeSpans": [scope_spans]}]}
@@ -129,18 +129,14 @@ def encode_json(
 
 # -- exporter -------------------------------------------------------------
 
-_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
-_BAD_VALUE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
-
 
 def _validated_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
     """Copy ``headers``; ``ValueError`` for a non-token name or a control character in a value."""
-    out: dict[str, str] = {}
-    for name, value in (headers or {}).items():
-        if not _TOKEN.fullmatch(name) or _BAD_VALUE.search(value):
-            raise ValueError(f"invalid HTTP header {name!r}")
-        out[name] = value
-    return out
+    headers = dict(headers or {})
+    problems = header_problems(headers)
+    if problems:
+        raise ValueError("invalid OTLP/HTTP headers: " + "; ".join(problems))
+    return headers
 
 
 def _status_error(status: int, reason: str) -> ExportError:
@@ -158,7 +154,8 @@ class HTTPExporter:
     :class:`~pyrock.trace.otlp.ExportError`; other non-2xx statuses (including
     redirects, which are never followed) raise
     :class:`~pyrock.trace.otlp.PermanentExportError`. ``headers`` are sent on
-    every request; ``ValueError`` if a name or value is invalid.
+    every request; ``ValueError`` if a name or value is invalid. Error
+    messages show the endpoint without credentials, query or fragment.
     """
 
     def __init__(
@@ -172,6 +169,7 @@ class HTTPExporter:
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self._endpoint = endpoint
+        self._shown = sanitize_url(endpoint)
         self._service = service
         self._resource = dict(resource or {})
         self._headers = {**_validated_headers(headers), "Content-Type": "application/json"}
@@ -208,28 +206,23 @@ class HTTPExporter:
             raise _status_error(exc.code, exc.reason) from None
         except (OSError, http.client.HTTPException, ValueError) as exc:
             # URLError, timeouts, resets, malformed responses, bad URLs
-            raise ExportError(f"OTLP/HTTP export to {self._endpoint} failed: {exc}") from exc
+            raise ExportError(f"OTLP/HTTP export to {self._shown} failed: {exc}") from exc
 
     def shutdown(self, *, timeout: float | None = None) -> None:
         """Stop exporting (idempotent); later exports send nothing."""
         self._stopped = True
 
+    def _after_fork_in_child(self) -> None:
+        """Fresh lock and opener in a forked child (the parent's lock may be held)."""
+        self._lock = threading.Lock()
+        self._opener = None
+
+    def _replace_resource(self, resource: Mapping[str, AttrValue], /) -> None:
+        """Use ``resource`` for later exports (a fork child's refreshed ``process.pid``)."""
+        self._resource = dict(resource)
+
     def _get_opener(self) -> urllib.request.OpenerDirector:
         with self._lock:
             if self._opener is None:
-                self._opener = _build_opener(self._ssl_context)
+                self._opener = no_redirect_opener(self._ssl_context)
             return self._opener
-
-
-def _build_opener(ssl_context: ssl.SSLContext | None) -> urllib.request.OpenerDirector:
-    """An opener that never follows redirects (headers may carry credentials)."""
-    import urllib.request
-
-    class NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-            return None
-
-    handlers: list[urllib.request.BaseHandler] = [NoRedirect()]
-    if ssl_context is not None:
-        handlers.append(urllib.request.HTTPSHandler(context=ssl_context))
-    return urllib.request.build_opener(*handlers)

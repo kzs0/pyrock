@@ -27,6 +27,8 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 
+from pyrock._transport import remaining as _remaining
+
 __all__ = [
     "H2Connection",
     "H2Error",
@@ -589,10 +591,6 @@ class HPACKDecoder:
 
 def _deadline(timeout: float | None) -> float | None:
     return None if timeout is None else time.monotonic() + timeout
-
-
-def _remaining(deadline: float | None) -> float | None:
-    return None if deadline is None else max(0.0, deadline - time.monotonic())
 
 
 def _status(fields: Sequence[Header]) -> int:

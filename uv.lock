@@ -525,7 +525,6 @@ wheels = [
 
 [[package]]
 name = "pyrock"
-version = "0.1.0.dev0"
 source = { editable = "." }
 
 [package.dev-dependencies]
@@ -550,7 +549,7 @@ compat = [
     { name = "protobuf", specifier = ">=5" },
 ]
 dev = [
-    { name = "coverage", extras = ["toml"], specifier = ">=7.6" },
+    { name = "coverage", extras = ["toml"], specifier = ">=7.10" },
     { name = "mypy", specifier = ">=1.13" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "ruff", specifier = ">=0.8" },

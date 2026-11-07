@@ -5,9 +5,20 @@ exceptions are caught and counted, so ``init()`` never blocks or fails on
 detection. A detector that misses the budget is abandoned (its thread is a
 daemon and every probe it makes has its own short timeout) and counted.
 
+Cloud metadata is only probed when a cheap local hint says the host may be
+on that cloud (:func:`cloud_hints`): the DMI identity files under
+``/sys/class/dmi/id`` (``sys_vendor``, ``product_name``, ``bios_vendor``) or
+the platform's environment variables (``AWS_EXECUTION_ENV``,
+``ECS_CONTAINER_METADATA_URI[_V4]``, ``AWS_REGION`` for AWS;
+``GCE_METADATA_HOST``, ``K_SERVICE``, ``GOOGLE_CLOUD_PROJECT`` for GCP). On
+other hosts no probe runs, so detection does not wait for unreachable
+link-local addresses.
+
 The metadata base URLs can be overridden with :data:`AWS_ENDPOINT_ENV` and
-:data:`GCP_ENDPOINT_ENV` (used by tests; an empty value disables that probe).
-Metadata requests never go through an HTTP proxy.
+:data:`GCP_ENDPOINT_ENV` (used by tests). A non-empty override forces that
+probe whatever the hints say; an empty value disables it. Without an override,
+``GCE_METADATA_HOST`` (``host[:port]``) replaces the GCP base, as in Google's
+client libraries. Metadata requests never go through an HTTP proxy.
 """
 
 from __future__ import annotations
@@ -34,6 +45,7 @@ __all__ = [
     "GCP_BASE",
     "GCP_ENDPOINT_ENV",
     "Detection",
+    "cloud_hints",
     "detect",
     "detect_aws",
     "detect_container",
@@ -58,6 +70,17 @@ _MAX_METADATA_BYTES = 4096
 _CONTAINER_ID_PREFIXES = ("docker-", "containerd-", "cri-containerd-", "crio-", "libpod-")
 _HEX = frozenset("0123456789abcdefABCDEF")
 _K8S_NAMESPACE_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+_DMI_DIR = "/sys/class/dmi/id"
+_DMI_FILES = ("sys_vendor", "product_name", "bios_vendor")
+_AWS_ENV_HINTS = (
+    "AWS_EXECUTION_ENV",
+    "ECS_CONTAINER_METADATA_URI",
+    "ECS_CONTAINER_METADATA_URI_V4",
+    "AWS_REGION",
+)
+_GCP_ENV_HINTS = ("GCE_METADATA_HOST", "K_SERVICE", "GOOGLE_CLOUD_PROJECT")
+_AWS_DMI_MARKERS = ("amazon", "ec2")
+_GCP_DMI_MARKERS = ("google",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,19 +100,16 @@ def detect(
 
     Results are merged in a fixed order (process, git, Kubernetes, container,
     cloud), whatever order the detectors finish in. AWS wins over GCP when
-    both answer. Container detection is skipped inside Kubernetes.
+    both answer. Container detection is skipped inside Kubernetes, and a
+    cloud's metadata is probed only with a hint or an override (see the
+    module docs).
     """
     env = os.environ if environ is None else environ
     local: list[Detector] = [detect_process, detect_git, functools.partial(detect_kubernetes, env)]
     if not _in_kubernetes(env):
         local.append(detect_container)
     clouds: list[Detector] = [
-        functools.partial(probe, base)
-        for variable, default, probe in (
-            (AWS_ENDPOINT_ENV, AWS_BASE, detect_aws),
-            (GCP_ENDPOINT_ENV, GCP_BASE, detect_gcp),
-        )
-        if (base := env.get(variable, default))
+        functools.partial(probe, base) for probe, base in _cloud_probes(env) if base
     ]
     detectors = local + clouds
 
@@ -124,6 +144,60 @@ def detect(
         attrs.update(found or {})
     attrs.update(next((found for found in snapshot[len(local) :] if found), {}))
     return Detection(attrs, failed)
+
+
+def _cloud_probes(
+    env: Mapping[str, str],
+) -> list[tuple[Callable[[str], dict[str, AttrValue]], str]]:
+    """``(probe, base)`` for each cloud worth probing; an empty base disables it."""
+    hints: frozenset[str] | None = None
+    probes: list[tuple[Callable[[str], dict[str, AttrValue]], str]] = []
+    for provider, variable, default, probe in (
+        ("aws", AWS_ENDPOINT_ENV, AWS_BASE, detect_aws),
+        ("gcp", GCP_ENDPOINT_ENV, _gcp_base(env), detect_gcp),
+    ):
+        if variable in env:  # an explicit override (empty: disabled) skips the hints
+            probes.append((probe, env[variable]))
+            continue
+        if hints is None:
+            hints = cloud_hints(env)
+        if provider in hints:
+            probes.append((probe, default))
+    return probes
+
+
+def _gcp_base(env: Mapping[str, str]) -> str:
+    host = env.get("GCE_METADATA_HOST", "").strip()
+    if host and "/" not in host and "@" not in host:
+        return f"http://{host}"
+    return GCP_BASE
+
+
+def cloud_hints(environ: Mapping[str, str] | None = None, /) -> frozenset[str]:
+    """The clouds (``"aws"``, ``"gcp"``) this host shows cheap local signs of.
+
+    Reads only environment variables and the DMI identity files; never touches
+    the network.
+    """
+    env = os.environ if environ is None else environ
+    found: set[str] = set()
+    if any(env.get(name) for name in _AWS_ENV_HINTS):
+        found.add("aws")
+    if any(env.get(name) for name in _GCP_ENV_HINTS):
+        found.add("gcp")
+    if len(found) < 2:
+        dmi = _dmi_identity()
+        if any(marker in dmi for marker in _AWS_DMI_MARKERS):
+            found.add("aws")
+        if any(marker in dmi for marker in _GCP_DMI_MARKERS):
+            found.add("gcp")
+    return frozenset(found)
+
+
+def _dmi_identity() -> str:
+    """The DMI vendor and product strings, lowercased and joined (``""`` when unreadable)."""
+    parts = [_read_first_line(os.path.join(_DMI_DIR, name)) for name in _DMI_FILES]
+    return " ".join(parts).lower()
 
 
 def _in_kubernetes(environ: Mapping[str, str]) -> bool:

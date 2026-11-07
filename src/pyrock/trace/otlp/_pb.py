@@ -13,6 +13,7 @@ import functools
 import struct
 from collections.abc import Iterable, Mapping, Sequence
 
+from pyrock._version import SCOPE_NAME
 from pyrock.attr import AttrValue, _normalize_value
 from pyrock.trace import Span, SpanEvent, StatusCode, TraceState
 
@@ -291,7 +292,7 @@ def encode_export_trace_request(
     *,
     service: str,
     resource: Mapping[str, AttrValue] | None = None,
-    scope_name: str = "pyrock",
+    scope_name: str = SCOPE_NAME,
     scope_version: str = "",
 ) -> bytes:
     """Encode ``ExportTraceServiceRequest`` bytes for ``spans``.

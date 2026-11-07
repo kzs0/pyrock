@@ -1,4 +1,4 @@
-"""The installed pyrock version (kept in sync with ``pyproject.toml``)."""
+"""The pyrock version. Hatch reads it from here (``pyproject.toml`` declares it dynamic)."""
 
 from __future__ import annotations
 

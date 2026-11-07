@@ -25,12 +25,13 @@ import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 from urllib.parse import urlsplit
 
-from pyrock._compat import is_positive_number
+from pyrock._compat import ConfigError, is_positive_number
+from pyrock._transport import header_problems, no_redirect_opener
 from pyrock._version import __version__
 from pyrock.metric import Registry, prometheus
+from pyrock.privacy import sanitize_url
 
 __all__ = ["MetricsPusher", "PushStats"]
 
@@ -52,20 +53,32 @@ class PushStats:
     """Ticks and :meth:`MetricsPusher.push_once` calls skipped because a push was in flight."""
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Turn every redirect into an error instead of resending credentials."""
-
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-        return None
+def _endpoint_problems(endpoint: object, *, allow_http: bool) -> list[str]:
+    if not isinstance(endpoint, str):
+        return ["metrics push endpoint must be an http(s) URL"]
+    shown = sanitize_url(endpoint)
+    try:
+        parts = urlsplit(endpoint)
+        valid = parts.scheme in ("http", "https") and bool(parts.hostname)
+    except ValueError:
+        valid = False
+    if not valid:
+        return [f"metrics push endpoint must be an http(s) URL: {shown!r}"]
+    if parts.scheme == "http" and not allow_http:
+        return [f"metrics push endpoint {shown!r} is plaintext http; set insecure=True to allow it"]
+    return []
 
 
 class MetricsPusher:
     """Pushes ``registry`` to ``endpoint`` every ``interval`` seconds from a daemon thread.
 
-    ``endpoint`` must be an absolute ``http(s)`` URL; ``headers`` are added
-    to every request (for example ``Authorization``). ``timeout`` bounds each
-    request. Thread-safe; :meth:`stop` is idempotent and may be called
-    concurrently.
+    ``endpoint`` must be an absolute ``http(s)`` URL; a plain ``http://`` one
+    is refused when ``allow_http`` is false (the cloud wiring passes its
+    ``insecure`` flag, so the API key never travels in plaintext by
+    accident). ``headers`` are added to every request (for example
+    ``Authorization``) and validated like every pyrock header. ``timeout``
+    bounds each request. Thread-safe; :meth:`stop` is idempotent and may be
+    called concurrently.
     """
 
     def __init__(
@@ -77,23 +90,28 @@ class MetricsPusher:
         headers: Mapping[str, str] | None = None,
         interval: float = 15.0,
         timeout: float = 10.0,
+        allow_http: bool = True,
     ) -> None:
-        """``ValueError`` for a non-URL endpoint or a non-positive interval or timeout."""
-        parts = urlsplit(endpoint)
-        if parts.scheme not in ("http", "https") or not parts.hostname:
-            raise ValueError(f"metrics push endpoint must be an http(s) URL: {endpoint!r}")
+        """``ConfigError`` (a ``ValueError``) listing every invalid setting."""
+        extra = dict(headers or {})
+        problems = [
+            *_endpoint_problems(endpoint, allow_http=allow_http),
+            *header_problems(extra, field="metrics push headers"),
+        ]
         if not is_positive_number(interval) or not is_positive_number(timeout):
-            raise ValueError("metrics push interval and timeout must be positive and finite")
+            problems.append("metrics push interval and timeout must be positive and finite")
+        if problems:
+            raise ConfigError(problems)
         self._registry = registry
         self._endpoint = endpoint
         self._headers = {
             "Content-Type": prometheus.CONTENT_TYPE,
             "User-Agent": f"pyrock/{__version__}",
-            **(headers or {}),
+            **extra,
         }
         self._interval = interval
         self._timeout = timeout
-        self._opener = urllib.request.build_opener(_NoRedirect)
+        self._opener = no_redirect_opener()
         self._reset()
 
     def _reset(self) -> None:
