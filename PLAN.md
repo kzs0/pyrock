@@ -534,3 +534,33 @@ Carried into Phase 4 review:
   double-`start_response` error. Revisit them.
 - **Docs:** README, CHANGELOG and DESIGN deviations (profile, numbering,
   samplers, the thread-context amendment).
+
+## Phase 4: review fixes
+
+The review findings are kept in the scratchpad at
+`/tmp/claude-0/-home-user/b67cdd0e-119e-51ba-9ac2-956a9ab27bf3/scratchpad/review/FINDINGS.md`
+(P0 to P3). Five work packages run in parallel on disjoint files:
+
+| Package | Scope |
+|---|---|
+| WP-1 | core (`_bedrock`, `_operation`, `_context`, `_noop`, `__init__`, `config`, `logs`, `_compat`, `testing`) |
+| WP-2 | data path and performance (`attr`, `privacy`, `trace/{__init__,w3c,http,sampler}`, `metric/*`) |
+| WP-3 | HTTP (`_httpcore` new, `wsgi`, `asgi`, `http`) |
+| WP-4a | `server` and `profile/*` |
+| WP-4b | export, cloud and packaging (`trace/otlp/*`, `_push`, `_cloud`, `_envdetect`, `pyproject`, `Makefile`, `.github/workflows/*`) |
+
+Agreed cross-package interfaces:
+
+- **`_transport`** is already written: `header_problems`, `remaining`,
+  `forward_fork`, `no_redirect_opener`, `HEADER_NAME`.
+- **`ConfigError`** lives in `_compat`. Every config type raises it.
+- **`Span._finish(attrs, code, message="")`** (WP-2) does one locked bulk set
+  of attrs and status plus `end()`. WP-1 calls it.
+- **`pyrock.profile._after_fork_in_child()`** (WP-4a) is called by WP-1's fork
+  hook through `sys.modules`.
+- **`grpc.parse_target(target, *, insecure=False) -> tuple[str, int, bool]`**
+  (WP-4b) returns `(host, port, plaintext)`. An `http://` scheme or
+  `insecure` means plaintext, and the default port is 4317. WP-1's
+  `_bedrock` uses it.
+- **Level table:** `_compat.LOG_LEVELS` (WP-1) maps lowercase names to ints,
+  `critical` included. Both `config` and `logs` use it.
