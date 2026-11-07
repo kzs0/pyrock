@@ -19,7 +19,10 @@ passed to the handler with ``PATH_INFO`` unchanged (the full
 Design: a small HTTP/1.1 server that owns its socket reads, so every timeout
 is a real deadline. One accept thread waits on the listener and a wake-up
 socket; each accepted connection holds a slot of a bounded semaphore and is
-served on its own daemon thread. A connection over the cap is answered ``503``
+served on its own daemon thread. An idle keep-alive connection waits on its
+socket *and* the same wake-up socket, so :meth:`Server.shutdown` ends idle
+waits at once on every platform (closing or shutting down a socket does not
+wake a thread blocked on it on Windows). A connection over the cap is answered ``503``
 with ``Connection: close`` by a short-lived (and itself bounded) thread.
 Responses are buffered, so a failing application never leaves partial output
 and every response carries ``Content-Length`` for keep-alive. Request bodies
@@ -482,17 +485,23 @@ def _linger(sock: socket.socket, /) -> None:
             pass
 
 
-def _peek(sock: socket.socket, timeout: float, /) -> bool:
-    """Wait up to ``timeout`` for input without consuming it; ``False`` on timeout or EOF."""
-    sock.settimeout(timeout)
-    try:
-        return bool(sock.recv(1, socket.MSG_PEEK))
-    except TimeoutError:
+def _wait_readable(sock: socket.socket, stop: socket.socket, timeout: float, /) -> bool:
+    """Wait up to ``timeout`` for ``sock`` to be readable; ``False`` on timeout or ``stop``.
+
+    ``stop`` becomes (and stays) readable at shutdown. Input or end-of-stream
+    on ``sock`` both count as readable; the request read tells them apart.
+    """
+    if timeout <= 0:
         return False
+    with selectors.DefaultSelector() as selector:
+        selector.register(sock, selectors.EVENT_READ)
+        selector.register(stop, selectors.EVENT_READ)
+        ready = {key.fileobj for key, _ in selector.select(timeout)}
+    return sock in ready and stop not in ready
 
 
 def _interrupt(sock: socket.socket, /) -> None:
-    """Wake any thread blocked on ``sock``; its owner then sees end-of-stream and closes it."""
+    """Cut ``sock`` so the peer sees it close (on POSIX this also wakes a blocked reader)."""
     with contextlib.suppress(OSError):
         sock.shutdown(socket.SHUT_RDWR)
 
@@ -502,11 +511,10 @@ def _interrupt(sock: socket.socket, /) -> None:
 
 @dataclass(eq=False, slots=True)
 class _Connection:
-    """An accepted connection; ``idle`` (guarded by the server lock) while awaiting a request."""
+    """An accepted connection."""
 
     sock: socket.socket
     peer: tuple[Any, ...]
-    idle: bool = False
 
 
 class Server:
@@ -527,6 +535,8 @@ class Server:
         self._address: tuple[str, int] | None = None
         self._bound = False
         self._wake: socket.socket | None = None
+        """Written once by :meth:`shutdown` and never drained, so it stays readable."""
+        self._wake_reader: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
 
     @property
@@ -557,7 +567,8 @@ class Server:
         """Stop accepting, wait for in-flight requests up to ``timeout``, close (idempotent).
 
         Idle keep-alive connections are closed at once; connections still busy
-        when the timeout passes are cut (their handlers finish on their own).
+        when the timeout passes are cut (their threads finish on their own,
+        within their read or write timeout).
         """
         budget = self._config.shutdown_timeout if timeout is None else float(seconds(timeout))
         deadline = time.monotonic() + budget
@@ -570,9 +581,6 @@ class Server:
             if self._wake is not None:
                 with contextlib.suppress(OSError):
                     self._wake.send(b"\0")
-            for conn in self._connections:
-                if conn.idle:
-                    _interrupt(conn.sock)
             bound, accept_thread = self._bound, self._accept_thread
         if bound:
             self._accept_done.wait(remaining())
@@ -599,12 +607,12 @@ class Server:
             wake_reader, wake_writer = socket.socketpair()
             wake_writer.setblocking(False)
             self._bound = True
-            self._wake = wake_writer
+            self._wake, self._wake_reader = wake_writer, wake_reader
             self._address = listener.getsockname()[:2]
         return listener, wake_reader
 
     def _accept_loop(self, listener: socket.socket, wake: socket.socket) -> None:
-        """Accept until :meth:`shutdown` writes to ``wake``; then close both sockets."""
+        """Accept until :meth:`shutdown` writes to ``wake``; then close the listener."""
         try:
             with selectors.DefaultSelector() as selector:
                 selector.register(listener, selectors.EVENT_READ)
@@ -615,12 +623,17 @@ class Server:
                         self._accept(listener)
         finally:
             with self._lock:
-                listener.close()
-                wake.close()
-                if self._wake is not None:
-                    self._wake.close()
-                    self._wake = None
-            self._accept_done.set()
+                listener.close()  # also resets connections still queued in the backlog
+                self._accept_done.set()
+                self._close_wake_if_done()
+
+    def _close_wake_if_done(self) -> None:
+        """Close the wake-up pair once nothing can wait on it any more (``_lock`` held)."""
+        if self._accept_done.is_set() and not self._connections:
+            for sock in (self._wake, self._wake_reader):
+                if sock is not None:
+                    sock.close()
+            self._wake = self._wake_reader = None
 
     def _accept(self, listener: socket.socket) -> None:
         """Accept one connection and hand it to a worker thread or the rejecter."""
@@ -674,6 +687,7 @@ class Server:
         with self._lock:
             self._connections.discard(conn)
             conn.sock.close()
+            self._close_wake_if_done()
             self._drained.notify_all()
         self._slots.release()
 
@@ -708,15 +722,11 @@ class Server:
     def _await_request(self, conn: _Connection, timeout: float) -> bool:
         """Wait (as an idle connection) up to ``timeout`` for the next request to start."""
         with self._lock:
-            if self._stopping.is_set():
+            stop = self._wake_reader
+            if self._stopping.is_set() or stop is None:
                 return False
-            conn.idle = True
-        try:
-            ready = timeout > 0 and _peek(conn.sock, timeout)
-        finally:
-            with self._lock:
-                conn.idle = False
-        return ready and not self._stopping.is_set()
+        # ``stop`` stays open while ``conn`` is registered (see ``_close_wake_if_done``).
+        return _wait_readable(conn.sock, stop, timeout) and not self._stopping.is_set()
 
     def _serve_request(
         self, conn: _Connection, buffered: bytes, started: float
