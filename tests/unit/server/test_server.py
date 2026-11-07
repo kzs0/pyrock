@@ -190,8 +190,10 @@ def test_shutdown_closes_the_listener_and_is_idempotent() -> None:
     addr = address(srv)
     srv.shutdown(timeout=5)
     srv.shutdown(timeout=5)
+    # Windows retries a refused SYN for about two seconds before reporting
+    # ConnectionRefusedError, so the connect timeout must outlast that.
     with pytest.raises(ConnectionRefusedError):
-        socket.create_connection(addr, timeout=1).close()
+        socket.create_connection(addr, timeout=5).close()
 
 
 def test_shutdown_without_in_flight_requests_is_quick() -> None:

@@ -139,8 +139,10 @@ def test_server_disabled_starts_nothing() -> None:
 def test_shutdown_stops_the_server() -> None:
     with running() as bedrock:
         addr = _address(bedrock)
+    # Windows retries a refused SYN for about two seconds before reporting
+    # ConnectionRefusedError, so the connect timeout must outlast that.
     with pytest.raises(ConnectionRefusedError):
-        socket.create_connection(addr, timeout=1).close()
+        socket.create_connection(addr, timeout=5).close()
 
 
 # ---------------------------------------------------------------- endpoints
@@ -338,8 +340,10 @@ def test_graceful_shutdown_waits_for_in_flight_requests() -> None:
         assert in_flight.result(timeout=5).status == 200
         stopper.result(timeout=5)
     assert done.is_set()
+    # Windows retries a refused SYN for about two seconds before reporting
+    # ConnectionRefusedError, so the connect timeout must outlast that.
     with pytest.raises(ConnectionRefusedError):
-        socket.create_connection(addr, timeout=1).close()
+        socket.create_connection(addr, timeout=5).close()
 
 
 def test_shutdown_timeout_bounds_the_wait() -> None:
