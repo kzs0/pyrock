@@ -284,10 +284,20 @@ def test_helpers_stay_functions_after_private_modules_load() -> None:
     assert "brk_test_key" not in repr(cfg)
 
 
+# The PyPI distribution is ``bedrock-py``; the import package is ``pyrock``.
+DISTRIBUTION = "bedrock-py"
+
+
+def test_distribution_is_installed_under_its_pypi_name() -> None:
+    dist = importlib.metadata.distribution(DISTRIBUTION)
+    assert dist.metadata["Name"] == DISTRIBUTION
+    assert dist.version == pyrock.__version__
+
+
 def test_py_typed_and_version() -> None:
     assert (importlib.resources.files("pyrock") / "py.typed").is_file()
-    assert importlib.metadata.version("pyrock") == pyrock.__version__
+    assert importlib.metadata.version(DISTRIBUTION) == pyrock.__version__
 
 
 def test_distribution_has_no_runtime_dependencies() -> None:
-    assert not importlib.metadata.requires("pyrock")
+    assert not importlib.metadata.requires(DISTRIBUTION)

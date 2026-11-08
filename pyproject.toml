@@ -3,7 +3,7 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "pyrock"
+name = "bedrock-py"  # the import package is `pyrock`
 # The version lives in src/pyrock/_version.py only (see [tool.hatch.version]).
 dynamic = ["version"]
 description = "Opinionated, zero-dependency observability for Python: traces, metrics, profiles and structured logs built around operations."

@@ -6,8 +6,9 @@ name: Release
 #   1. verify  - tag format, tag == package version, dated CHANGELOG section,
 #                and the tagged commit is on main;
 #   2. ci      - the full CI workflow (matrix, compat, stress, build);
-#   3. pypi    - publishes the exact files CI built and checked, using PyPI
-#                trusted publishing (OIDC, no stored token);
+#   3. pypi    - publishes the exact files CI built and checked to the PyPI
+#                project `bedrock-py` (the import package is `pyrock`),
+#                using trusted publishing (OIDC, no stored token);
 #   4. github  - creates the GitHub Release with the CHANGELOG notes and the
 #                distribution files attached.
 #
@@ -65,7 +66,7 @@ jobs:
     timeout-minutes: 10
     environment:
       name: pypi
-      url: https://pypi.org/project/pyrock/${{ needs.verify.outputs.version }}/
+      url: https://pypi.org/project/bedrock-py/${{ needs.verify.outputs.version }}/
     permissions:
       id-token: write # PyPI trusted publishing
     steps:
@@ -78,8 +79,8 @@ jobs:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           ls -l dist/
-          test -f "dist/pyrock-${VERSION}-py3-none-any.whl"
-          test -f "dist/pyrock-${VERSION}.tar.gz"
+          test -f "dist/bedrock_py-${VERSION}-py3-none-any.whl"
+          test -f "dist/bedrock_py-${VERSION}.tar.gz"
           test "$(ls dist | wc -l)" -eq 2
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
 

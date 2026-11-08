@@ -43,8 +43,11 @@ with pyrock.init(service="users-api"):
 ## Install
 
 ```bash
-pip install pyrock
+pip install bedrock-py
 ```
+
+The distribution on PyPI is `bedrock-py`; the package you import is `pyrock`
+(`import pyrock`). The name `pyrock` is taken on PyPI.
 
 - CPython **3.11 or newer**, including the free-threaded build (3.14t, with the
   GIL disabled). Every shared structure is guarded by a lock; nothing relies on
