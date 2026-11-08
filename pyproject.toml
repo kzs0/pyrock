@@ -1,0 +1,186 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyrock"
+# The version lives in src/pyrock/_version.py only (see [tool.hatch.version]).
+dynamic = ["version"]
+description = "Opinionated, zero-dependency observability for Python: traces, metrics, profiles and structured logs built around operations."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Kenzo Spaulding" }]
+keywords = ["observability", "tracing", "metrics", "logging", "profiling", "opentelemetry", "prometheus", "otlp"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Programming Language :: Python :: Free Threading :: 3 - Stable",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: System :: Logging",
+    "Topic :: System :: Monitoring",
+    "Typing :: Typed",
+]
+# Intentionally empty: pyrock has no runtime dependencies.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/kzs0/pyrock"
+Source = "https://github.com/kzs0/pyrock"
+Changelog = "https://github.com/kzs0/pyrock/blob/main/CHANGELOG.md"
+
+# Registers the `pyrock_capture` fixture. The module never imports pytest; it
+# only uses it when pytest itself is loading the plugin.
+[project.entry-points.pytest11]
+pyrock = "pyrock.testing"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    # 7.10+ for `[tool.coverage.run] patch` (coverage in forked children).
+    "coverage[toml]>=7.10",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+# Test-only: decode our OTLP bytes with the official schema and run a real
+# gRPC collector. Tests that need these skip cleanly when they are missing.
+compat = [
+    "protobuf>=5",
+    "opentelemetry-proto>=1.27",
+    "grpcio>=1.66",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.hatch.version]
+path = "src/pyrock/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pyrock"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/pyrock",
+    "tests",
+    "examples",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "DESIGN.md",
+    "LICENSE",
+]
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests", "scripts"]
+# Docs (DESIGN.md etc.) contain illustrative snippets, not formatted code.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F",   # pycodestyle, pyflakes
+    "I",             # isort
+    "UP",            # pyupgrade
+    "B",             # bugbear
+    "SIM",           # simplify
+    "RUF",           # ruff-specific
+    "PT",            # pytest style
+    "ANN",           # annotations (src only, see per-file-ignores)
+    "C4",            # comprehensions
+    "PIE",
+    "RET",
+    "TC",            # type-checking imports
+    "PGH",           # pygrep hooks (no blanket type: ignore)
+    "PERF",
+    "FA",            # future annotations
+    "ISC",
+    "G",             # logging format
+    "T20",           # no print in src
+    "S",             # bandit-lite
+]
+ignore = [
+    "ANN401",  # Any is sometimes the honest type (carriers, WSGI environ values)
+    "S101",    # assert is fine in tests; src uses explicit raises
+    "S310",    # urllib with user-provided URLs is the point of the exporters
+    "ISC001",  # conflicts with the formatter
+    "RET505",  # explicit else after return is often clearer
+    "PERF401", # explicit loops read better in validation code
+    "TC001", "TC002", "TC003",  # runtime-visible annotations are fine with __future__
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN", "S", "T20", "PERF", "B011"]
+"scripts/tests/**" = ["ANN", "S", "T20", "PERF", "B011"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pyrock"]
+required-imports = ["from __future__ import annotations"]
+
+[tool.ruff.lint.flake8-pytest-style]
+fixture-parentheses = false
+mark-parentheses = false
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+# scripts/ holds CI tooling (stdlib only); `make report-check` type-checks it.
+files = ["src", "scripts"]
+mypy_path = "src"
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+xfail_strict = true
+markers = [
+    "e2e: black-box tests that observe only external output (collectors, /metrics, logs)",
+    "unit: contract tests for a single module",
+    "compat: needs the optional compat dependency group (protobuf, opentelemetry-proto, grpcio)",
+    "slow: takes more than a second or two",
+    "linux_only: depends on Linux-only facilities (/proc, cgroups, pthread cpu clocks)",
+    "fork: uses os.fork(); skipped where fork is unavailable or unsafe",
+]
+
+# ---------------------------------------------------------------- coverage
+[tool.coverage.run]
+branch = true
+source = ["pyrock"]
+# Forked children (the fork tests) and Python subprocesses (the import-time
+# structure tests) write their own data files: `_exit` saves a child's data
+# before os._exit, `subprocess` starts coverage in child interpreters. Every
+# `coverage run` is therefore followed by `coverage combine` (Makefile, CI).
+parallel = true
+patch = ["_exit", "subprocess"]
+
+[tool.coverage.paths]
+source = ["src/pyrock", "*/site-packages/pyrock"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.$",
+    "@overload",
+]

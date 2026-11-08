@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+
+# Environments and tools
+.venv/
+venv/
+.python-version
+.uv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.dmypy.json
+
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Profiles and editors
+*.prof
+*.pprof
+.idea/
+.vscode/
+.DS_Store
+
+# Profiler output
+*.prof
+prof.out
