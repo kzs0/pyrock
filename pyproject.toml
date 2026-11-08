@@ -70,7 +70,17 @@ path = "src/pyrock/_version.py"
 packages = ["src/pyrock"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/pyrock", "tests", "README.md", "CHANGELOG.md", "LICENSE", "DESIGN.md"]
+include = [
+    "src/pyrock",
+    "tests",
+    "examples",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "DESIGN.md",
+    "LICENSE",
+]
 
 # ---------------------------------------------------------------- ruff
 [tool.ruff]

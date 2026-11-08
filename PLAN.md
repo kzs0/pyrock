@@ -584,3 +584,18 @@ Agreed cross-package interfaces:
     - A small, irreducible part of the import cost remains, about 18 ms from
       stdlib `logging` and `dataclasses`. `import pyrock` is now about 41 ms,
       against the 15 ms in DESIGN.
+
+## Phase 4 complete
+
+- **Review fixes:** all five packages landed (P0–P3, apart from decisions
+  37–41).
+- **Docs:**
+  - `README`, `CHANGELOG`, `CONTRIBUTING` and `SECURITY`;
+  - `DESIGN.md` brought in line with the implementation;
+  - `examples/`, plus copy-in recipes for httpx, requests, gRPC, Flask,
+    Django and FastAPI.
+- **Local matrix:** 3.11, 3.12, 3.13, 3.14 and 3.15b are green.
+  - On 3.14t, one failure appeared once and did not reproduce in 3 reruns or
+    in the CI 3.14t lane and stress job.
+  - The compat suite is green.
+- **CI:** green on the PR head before the docs commit.

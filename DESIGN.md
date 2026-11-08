@@ -1,6 +1,6 @@
 # pyrock — Bedrock for Python
 
-**Status:** design proposal · **Target:** feature parity with `github.com/kzs0/bedrock` · **Dependencies:** none (CPython standard library only)
+**Status:** implemented (0.1.0.dev0); where the implementation deviated, this document has been updated and `PLAN.md` records the decision · **Target:** feature parity with `github.com/kzs0/bedrock` · **Dependencies:** none (CPython standard library only)
 
 pyrock is the Python version of Bedrock. It is one opinionated library that
 covers traces, metrics, profiles and structured logs, built around *operations*
@@ -56,7 +56,8 @@ with pyrock.init(service="users-api"):
 **Baseline:** CPython **3.11+**. 3.10 reaches end of life in October 2026.
 3.11 gives us `ExceptionGroup`, `asyncio.TaskGroup`, `tomllib`, and fast
 `contextvars`. The library is tested on 3.11 through 3.14, including the
-free-threaded build (3.13t/3.14t). It never relies on the GIL for correctness.
+free-threaded build (3.14t, run with `PYTHON_GIL=0`) and the 3.15 pre-release.
+It never relies on the GIL for correctness.
 
 ---
 
@@ -104,20 +105,25 @@ rest are available as methods. This is what libraries and tests use.
 pyrock/
 ├── __init__.py          # Public API re-exports (init, operation, step, source, info, counter, ...)
 ├── py.typed
-├── _bedrock.py          # Bedrock class: lifecycle, accessors, method versions of the API
-├── _context.py          # ContextVars + bind/wrap/copy helpers
-├── _noop.py             # Singleton noop Bedrock/Operation/Step/Source/metrics
-├── config.py            # Config dataclass, from_env(), default()
+├── _version.py          # __version__, SCOPE_NAME (utility: imports nothing from pyrock)
+├── _compat.py           # Feature detection, ConfigError, LOG_LEVELS, validation helpers (utility)
+├── _types.py            # WSGI/ASGI type aliases (utility)
+├── _transport.py        # Header validation, deadlines, no-redirect opener, fork forwarding (utility)
+├── _bedrock.py          # Bedrock class + noop instance: lifecycle, accessors, fork hook, module helpers
+├── _context.py          # ContextVars + bind, ContextThreadPoolExecutor (lazy), Thread
+├── _noop.py             # Preallocated noop counter/gauge/histogram
+├── config.py            # Config dataclass, ENV_VARS, from_env(), default() (ConfigError re-exported from _compat)
 ├── env.py               # Env marker, parse(dataclass_type) -> instance
 ├── attr.py              # AttrValue typing, Event, error normalization, Attrs (ordered, deduped)
-├── _operation.py        # Operation, Step, Source (context managers + decorators)
+├── _operation.py        # Operation, Step, Source + their noop singletons (context managers + decorators)
 ├── trace/
-│   ├── __init__.py      # Tracer, Span, SpanContext, SpanKind, current_span()
+│   ├── __init__.py      # Tracer, Span, SpanContext, SpanKind, StatusCode, TraceState, current_span()
 │   ├── sampler.py       # Sampler Protocol, AlwaysOn, AlwaysOff, Ratio, ParentBased
 │   ├── propagator.py    # Propagator Protocol, CompositePropagator
 │   ├── w3c.py           # parse/format traceparent & tracestate, validation
 │   ├── http.py          # HTTPPropagator for header Mappings / MutableMappings
 │   └── otlp/
+│       ├── __init__.py  # ExportError, PermanentExportError
 │       ├── _pb.py       # Minimal hand-written protobuf varint/len-delimited encoder
 │       ├── _h2.py       # Minimal HTTP/2 client (TLS+ALPN "h2" or h2c) + HPACK literals
 │       ├── http.py      # OTLP/HTTP JSON exporter (urllib)
@@ -130,14 +136,18 @@ pyrock/
 ├── logs.py              # BedrockHandler, JSONFormatter, CorrelationFilter, canonical log
 ├── privacy.py           # Policy dataclass + enforcement walker
 ├── server.py            # Observability server (ThreadingHTTPServer, hardened)
+├── _httpcore.py         # Request instrumentation shared by wsgi, asgi and http.server
 ├── wsgi.py              # WSGI middleware
-├── asgi.py              # ASGI 3 middleware (http + lifespan passthrough)
-├── http.py              # urllib TracingHandler, request/get/post, inject_headers
+├── asgi.py              # ASGI 3 middleware (http, opt-in websocket, lifespan passthrough)
+├── http.py              # urllib TracingHandler, request/get/post, build_opener, instrument_http_server
 ├── _cloud.py            # cloud() option, retry + fan-out exporters, wiring
 ├── _envdetect.py        # process/git/k8s/container/AWS/GCP detection
 ├── _push.py             # metrics push loop
 ├── profile/
-│   ├── __init__.py      # ProfileType, ProfileExportConfig, start_export()
+│   ├── __init__.py      # Re-exports: ProfileType, ProfileExportConfig, start_export(), locks
+│   ├── _config.py       # ProfileType, ProfileExportConfig, ProfileExportStats
+│   ├── _export.py       # ProfileExporter thread (collect, encode, POST, retry)
+│   ├── _frames.py       # Stack interning shared by the collectors
 │   ├── _sampler.py      # Wall/CPU sampling profiler thread
 │   ├── _heap.py         # tracemalloc snapshots
 │   ├── _stacks.py       # Thread + asyncio task stack dumps
@@ -148,16 +158,24 @@ pyrock/
 └── testing.py           # In-memory exporters, capture() helper, pytest-friendly assertions
 ```
 
-Import rules mirror Go. `attr`, `env` and `privacy` import nothing from pyrock.
-`trace` imports `attr`. `metric` imports `attr`. `logs` imports `attr` and
-`trace`. Only the top-level modules (`_bedrock`, `_operation`, `wsgi`, `asgi`,
-`http`, `_cloud`) see everything. A test enforces this, as
+Import rules mirror Go. The utility modules (`_types`, `_compat`, `_version`,
+`_transport`) import nothing from pyrock, and any module may import them.
+`attr`, `env` and `privacy` import only utilities. `trace` and `metric` import
+`attr` and `privacy`. `logs` imports `attr`, `trace` and `privacy`. `server`
+imports `metric`; `profile` imports `attr`, `privacy` and `trace`; `config`
+imports `env`, `privacy` and (lazily, for type checks) `trace` and `profile`.
+Only the top-level modules (`_bedrock`, `_context`, `_noop`, `_operation`,
+`_httpcore`, `wsgi`, `asgi`, `http`, `_cloud`, `testing`) see everything. A test enforces this, as
 `dependency_boundary_test.go` does in Go, by walking the AST of each module.
 The same test asserts that every `import` resolves to the stdlib
 (`sys.stdlib_module_names`).
 
-Heavy modules (`profile`, `_cloud`, `trace.otlp.grpc`) load lazily so
-`import pyrock` stays cheap (target: under 15 ms).
+Heavy modules (`profile`, `_cloud`, `trace.otlp.grpc`, `_h2`, `server`,
+`wsgi`, `asgi`, `http`, `_httpcore`, `testing`) load lazily so `import pyrock`
+stays cheap. The original target was 15 ms; the implementation takes about
+40 ms, of which about 18 ms is stdlib `logging` and `dataclasses` and cannot be
+avoided (PLAN decision 41). `tests/structure/test_import_cost.py` guards
+against eager imports with a loose budget.
 
 ---
 
@@ -425,9 +443,11 @@ instrumented once an instance is active. The noop path costs one
 `ContextVar.get()` plus a direct call. The function is returned unchanged only
 when an explicit noop `bedrock=` is given. Library authors can instrument
 freely: apps that never call `init()` pay about one `ContextVar.get()` per
-call. A benchmark in CI asserts this using
-`tracemalloc` (no allocations in steady state) and a timing budget, like Go's
-`BenchmarkOperation_Noop`.
+call. An e2e test (`tests/e2e/test_noop.py`) asserts with `tracemalloc` that
+the noop path allocates nothing in steady state, the counterpart of Go's
+`BenchmarkOperation_Noop`. There is no separate timing benchmark (§20). The
+noop singletons live next to what they replace: operation, step and source in
+`_operation`, the noop instance in `_bedrock`, and metrics in `_noop`.
 
 ---
 
@@ -555,6 +575,9 @@ class Config:
   `BEDROCK_SERVER_ADDR`, `BEDROCK_DISABLE_ENVIRONMENT_DETECTION` and every other
   variable in the Go table, plus the Python-only `BEDROCK_LOG_INSTALL` and
   `BEDROCK_SERVER_MAX_CONNECTIONS` (a positive integer).
+- `log_level` takes level names only (`debug`, `info`, `warn`/`warning`,
+  `error`, `critical`, any case); the log helpers also accept ints (PLAN
+  decision 37).
 - Validation matches Go: the sample rate must be in [0, 1], and
   `trace_sample_rate=0` disables recording. Buckets must be finite and strictly
   increasing. Timeouts must be positive. `server_pprof=True` without a
@@ -613,8 +636,8 @@ so every service makes the same decision for a trace), and `ParentBased(root)`
 `should_sample(trace_id, name, parent_sampled) -> SamplingResult`. As in Go,
 sampling controls export, not span creation.
 
-**Differences from Go**, which pyrock makes on purpose (and the README
-documents): Go's `RatioSampler` draws a random number per span, whereas
+**Differences from Go**, which pyrock makes on purpose (PLAN decision 26; the
+README documents them): Go's `RatioSampler` draws a random number per span, whereas
 `Ratio` depends only on the trace ID. Go's `ParentBasedSampler` consults the
 root sampler when the parent is unsampled, whereas `ParentBased` drops spans
 whose parent is unsampled.
@@ -641,8 +664,9 @@ small HTTP/2 client:
   length-delimited fields. There is no reflection and no `.proto` compilation.
 
 The Go repo does the same (`internal/h2c`). Its `compat/otlp` suite becomes
-pyrock's `compat/` tox environment, which installs `opentelemetry-proto` and
-`grpcio` **as test-only dependencies**. It decodes our bytes with the official
+pyrock's `compat` dependency group and `compat`-marked tests (`make compat`),
+which install `protobuf`, `opentelemetry-proto` and `grpcio` **as test-only
+dependencies**. It decodes our bytes with the official
 schema and runs against a real collector.
 
 `BatchProcessor` behaves as in Go: a bounded `queue` (default 2048 spans),
@@ -760,7 +784,9 @@ Both middlewares:
   `success_codes` marks failure without raising.
 - Measure duration until the response body finishes: when the WSGI iterable's
   `close()` runs, or at the last ASGI `more_body=False`. This way streaming
-  responses are timed correctly.
+  responses are timed correctly. Because the WSGI middleware wraps the
+  response iterable, a server's `wsgi.file_wrapper` fast path is not used for
+  instrumented responses.
 - ASGI passes `lifespan` and `websocket` scopes through. WebSocket
   instrumentation is opt-in (`websocket=True`), and covers the whole connection
   as one `SERVER` operation named `http.websocket` (an explicit
@@ -834,8 +860,13 @@ pyrock.inject_headers(headers)       # writes traceparent/tracestate into any Mu
 # requests: Session adapter  → session.mount("https://", PyrockAdapter())
 ```
 
-The recipes live in `examples/`, not in the package, because the package must
-not import `httpx` or `requests`.
+The recipes live in `examples/recipes/`, not in the package, because the
+package must not import `httpx` or `requests`.
+
+**Limitation:** urllib has no hook for a request that fails before a
+response. Openers from `pyrock.http.build_opener` (and so `request`/`get`/
+`post`) end the span with the error; a `TracingHandler` added to a plain
+urllib opener never exports the span of such a request.
 
 ### 9.4 Propagators
 
@@ -876,7 +907,7 @@ with pyrock.operation("consume", remote_parent=KafkaPropagator().extract(msg.hea
 ```
 
 The gRPC interceptor example (Go's `example/grpc`) becomes
-`examples/grpc_interceptors.py`, a client and server interceptor for `grpcio`
+`examples/recipes/grpc_interceptors.py`, a client and server interceptor for `grpcio`
 to copy into a project.
 
 ---
@@ -914,7 +945,11 @@ def q(): ...
   `MetricConflictError` at registration. Re-registering the same schema returns
   the existing metric. Past `metric_series_limit`, new series are dropped and
   counted in `registry.dropped_series()`. Past `metric_family_limit`,
-  registration raises.
+  registration raises. A different `help` text on re-registration is not a
+  conflict: the first registration wins, as in Go. Unlike Go, counters raise
+  `ValueError` on negative or NaN increments (PLAN decision 33).
+  `MetricConflictError` and `MetricLimitError` (like `Activation`) are
+  importable from `pyrock` but are not in `__all__` (decision 39).
 - Counters and gauges use one `threading.Lock` per series (correct on
   free-threaded builds). Histograms use bucket arrays and `bisect`.
 
@@ -994,20 +1029,21 @@ type from stdlib pieces and encodes the results **natively** as OTLP Profiles
 
 | `ProfileType` | Go meaning | Python implementation | Sample types |
 |---|---|---|---|
-| `CPU` | CPU samples | A sampler thread wakes at 100 Hz (configurable), reads `sys._current_frames()`, and keeps threads whose CPU clock advanced (`time.pthread_getcpuclockid` + `clock_gettime` on Linux, with a wall-clock fallback marked as such). On 3.12+ it reads asyncio task identity as a label. | `samples/count`, `cpu/nanoseconds` |
+| `CPU` | CPU samples | A sampler thread wakes at 100 Hz (configurable), reads `sys._current_frames()`, and keeps threads whose CPU clock advanced (`time.pthread_getcpuclockid` + `clock_gettime` on Linux, with a wall-clock fallback marked by a `profile.note` attribute). Samples carry no asyncio task label (the planned 3.12+ task-identity label was not implemented). | `samples/count`, `cpu/nanoseconds` |
 | `WALL` *(Python extra)* | — | The same sampler without the CPU filter. Useful for I/O-bound async apps. | `samples/count`, `wall/nanoseconds` |
 | `HEAP` | allocation samples | `tracemalloc` snapshot diffs per interval (`traceback_limit` 32). tracemalloc starts only when `HEAP` is selected; on export stop it is stopped only if pyrock started it. The cost is documented (around 10–30% allocation overhead). | `alloc_space/bytes`, `inuse_space/bytes`, `alloc_objects/count` |
 | `GOROUTINE` | goroutine stacks | Stacks of all threads (`sys._current_frames`) plus pending asyncio tasks (`Task.get_stack`) on tracked loops. Exposed as `ProfileType.THREADS`, with `GOROUTINE` as an alias for parity. | `threads/count`, `tasks/count` |
-| `MUTEX` / `BLOCK` | contention | Python exposes no global contention data. pyrock provides **opt-in instrumented primitives**, `pyrock.profile.Lock`, `RLock`, `Condition` and `Semaphore`, as drop-in replacements that record wait time with `sample_fraction` / `block_rate` sampling. The `MUTEX`/`BLOCK` profiles aggregate those. With no instrumented locks they are empty and say so in a `profile.note` attribute. | `contentions/count`, `delay/nanoseconds` |
+| `MUTEX` / `BLOCK` | contention | Python exposes no global contention data. pyrock provides **opt-in instrumented primitives** as drop-in replacements that record wait time when contended: `pyrock.profile.Lock` and `RLock` feed `MUTEX` (sampled by `mutex_sample_fraction`, one in N, scaled by N, as in Go), `Condition` and `Semaphore` feed `BLOCK` (sampled by `block_sample_rate` seconds, as in Go). Both are disabled (and counted as skipped by the exporter) while their sampling setting is 0. With no instrumented locks they are empty and say so in a `profile.note` attribute. | `contentions/count`, `delay/nanoseconds` |
 
 The sampling profiler is a Python thread, so it measures what the interpreter
 can see. Time in C extensions shows up under the Python frame that called
-them. Overhead at 100 Hz is about 1–3% per busy thread (we benchmark this in
-CI). Unlike `sys.setprofile`, it doesn't conflict with debuggers or coverage.
+them. Overhead at 100 Hz is expected to be about 1–3% per busy thread (this
+is not benchmarked in CI). Unlike `sys.setprofile`, it doesn't conflict with debuggers or coverage.
 `cProfile` users are not affected. The Go rule "CPU profiling is process-wide
 and conflicting collection is skipped, never stopped" becomes a check for
 another pyrock sampler in the process (or a `PYROCK_PROFILER_OWNER` marker).
-If one exists, collection is skipped and counted.
+If one exists, collection is skipped and counted. The slot is per process:
+a claim inherited through `fork` does not block the child.
 
 ### 12.2 OTLP export
 
@@ -1029,8 +1065,12 @@ pyrock.init(
 )
 ```
 
-This matches Go's `ProfileExportConfig`. The default types are CPU, HEAP and
-THREADS. `types=[]` disables collection. Redirects are never followed.
+This matches Go's `ProfileExportConfig`, including its limits: `retries` is
+0–3 and `max_bytes` at most 32 MiB (PLAN decision 36). The default types are
+CPU, HEAP and THREADS. `types=[]` disables collection. Redirects are never
+followed. Unlike Go, the exporter collects every type once immediately on start,
+then once per `interval` (an overrunning collection drops missed ticks). Each
+upload carries an `x-profile-type` header.
 `bedrock.profile_stats()` returns exports, failures and skips.
 `bedrock.start_profile_export(cfg)` starts an extra exporter that is also
 stopped by `shutdown()`. Profile labels go through the privacy policy only if
@@ -1046,16 +1086,25 @@ pyrock.init(server_pprof=True, server_profile_handler=debug.app())
 `/debug/pprof/profile?seconds=N` (`N` above 30 is rejected with `400`, as in Go), `/heap`, `/goroutine`
 (threads and tasks), `/mutex` and `/block` return **gzipped pprof** that works
 with `go tool pprof` and Pyroscope. `?debug=1` on `goroutine` returns text
-stacks. GET only. Importing `pyrock` registers nothing. This module has to be
-imported explicitly, matching Go's isolation of `net/http/pprof`.
+stacks. GET only. `/heap` reports allocations since the previous `/heap`
+request and needs tracemalloc to be tracing already (HEAP export or
+`PYTHONTRACEMALLOC`); otherwise the profile is empty with a note. `/profile`
+answers `503` while another sampler owns the process. `/debug/pprof` without a
+trailing slash is 404 (PLAN decision 38). Importing `pyrock` registers
+nothing. This module has to be imported explicitly, matching Go's isolation of
+`net/http/pprof`.
 
 ---
 
 ## 13. Environment auto-detection
 
 This runs during `init()` unless `disable_environment_detection`. Every
-detector runs in a thread pool with a **500 ms total budget**. Exceptions are
-caught and counted, and init never blocks or fails because of detection.
+detector runs on its own daemon thread under a **500 ms total budget**; a
+detector that misses it is abandoned and counted. Exceptions are caught and
+counted, and init never blocks or fails because of detection. Cloud metadata
+is probed only when a cheap local hint (DMI identity files, platform
+environment variables) suggests that cloud, so ordinary hosts never wait on
+link-local addresses.
 
 | Attribute | Source |
 |---|---|
@@ -1112,29 +1161,40 @@ dicts/lists), metric label values and profile labels.
 
 - **Thread safety:** all shared state (registry, series, batch queue, numbering
   counters) is protected by `threading.Lock`. CI runs the test suite on
-  free-threaded 3.13t and 3.14t with `PYTHON_GIL=0`. The equivalent of Go's
-  race detector is running every concurrency test with `--count=50` on the
-  free-threaded build, plus `sys.setswitchinterval(1e-6)` stress on the GIL
-  build.
+  free-threaded 3.14t with `PYTHON_GIL=0`. The equivalent of Go's race
+  detector is a CI stress job (`make stress`) that repeats the fork, context,
+  batch and server tests 10 times on 3.14t, plus `sys.setswitchinterval(1e-6)`
+  stress inside individual concurrency tests.
+- **Thread context:** pyrock does not monkey-patch `threading` (PLAN decision
+  2). Context crosses threads only through `bind`, `ContextThreadPoolExecutor`
+  and `pyrock.Thread`, or through the middlewares, which activate their
+  captured instance per request (decision 18). When the interpreter inherits
+  context into new threads (`sys.flags.thread_inherit_context`, the default on
+  free-threaded 3.14), plain threads see the active instance; pyrock does not
+  fight that.
 - **Async:** nothing pyrock does blocks the event loop. Spans are queued with
   `put_nowait`, metrics take a short lock, logs go through `logging`, and
   network I/O happens on worker threads. `ashutdown()` runs the flush in
   `asyncio.to_thread`.
 - **`fork()` (gunicorn, uWSGI, `multiprocessing` fork):** threads don't survive
   a fork, so pyrock registers `os.register_at_fork`:
-  - *before:* take the exporter locks so the child gets a consistent snapshot;
-  - *after in parent:* release them;
-  - *after in child:* reset the queues, restart the batch, push and profile
-    threads, reseed nothing (IDs come from `os.urandom`), zero all metric
-    series, and **don't** start the observability server, because the parent
-    owns the port. `process.pid` is refreshed.
+  - *before:* hold the live-instance registry lock and note which profile
+    exporters are running;
+  - *after in parent:* release it;
+  - *after in child:* replace every lock a parent thread might have held,
+    reset process-wide profiling state, build a fresh batch pipeline (its
+    worker starts lazily), forward the reset to wrapping exporters and cloud
+    wiring, restart the push and profile threads, reseed nothing (IDs come
+    from `os.urandom`), zero all metric series, and **don't** start the
+    observability server, because the parent owns the port. `process.pid` is
+    refreshed.
 
-  Pre-fork servers therefore need a metrics strategy. The documented options:
-  (a) call `pyrock.init()` in the worker's post-fork hook
-  (`post_worker_init` / `@postfork`) with `server_addr="127.0.0.1:0"` plus
-  service discovery, (b) use metrics push (cloud, or the generic
-  `push_url=` push gateway mode), or (c) set `BEDROCK_SERVER_ADDR=127.0.0.1:{9090+worker}`
-  with `{worker}` substitution. Option (c) is an open question below.
+  Pre-fork servers therefore need a metrics strategy. The recommended practice
+  (PLAN decision 3) is to call `pyrock.init()` in the worker's post-fork hook
+  (`post_worker_init` / `@postfork`), with `server_addr="127.0.0.1:0"` plus
+  service discovery or with `server_enabled=False` and the cloud metrics push.
+  There is no generic push-gateway mode and no `{worker}` substitution in
+  `server_addr` in v0.
 - **Subinterpreters (3.12+/3.14 `concurrent.interpreters`):** each interpreter
   that calls `init()` gets its own instance. Nothing is shared.
 
@@ -1203,8 +1263,14 @@ def test_process_user():
 async def test_async_path():
     with capture() as t:
         await handler()
-    assert t.spans.names() == ["http.request", "db.get_user", "db.get_user[1]"]
+    assert t.spans.names() == ["db.get_user", "db.get_user[1]", "http.request"]   # end order
 ```
+
+Spans are listed in the order they ended, so children come before their
+parent. `capture()` defaults to `server_enabled=False`,
+`disable_environment_detection=True`, `runtime_metrics=False` and
+`log_install="pyrock"`, ignores the environment, and exports spans
+synchronously to memory.
 
 Spans are complete once the block exits, while `t.metrics.text()` and
 `t.metrics.value()` also work inside it. `t.spans.find(kind=...)` filters by
@@ -1217,7 +1283,9 @@ instance, so nested captures compose.
 `capture()` is an ordinary context manager, so it needs no pytest plugin. A
 pytest entry point (`pyrock_capture` fixture) is registered through
 `entry_points` metadata only. It loads only when pytest is present, which keeps
-the package dependency-free.
+the package dependency-free. Loading the plugin imports the pyrock core (about
+40 ms once per pytest session); avoiding that would need an entry point
+outside the package and is deferred (PLAN decision 40).
 
 ---
 
@@ -1230,9 +1298,9 @@ import pyrock
 from pyrock.asgi import Middleware
 from fastapi import FastAPI
 
-bedrock = pyrock.init(service="users-api", static_attrs={"env": "prod"})
+bedrock = pyrock.Bedrock(service="users-api", static_attrs={"env": "prod"})   # live, not activated
 app = FastAPI(lifespan=lambda app: bedrock)        # Bedrock is an async context manager → shutdown on exit
-app.add_middleware(Middleware)
+app.add_middleware(Middleware, bedrock=bedrock)    # pinned: active in every request
 
 @app.get("/users/{user_id}")
 @pyrock.operation("get_user", metric_labels=["tier"])
@@ -1313,39 +1381,47 @@ def process_job(job):
 
 These mirror Bedrock's CI rules:
 
-- **Matrix:** CPython 3.11 and 3.14 (the floor and newest, like Go 1.24/1.26),
-  plus 3.13t/3.14t free-threaded. PyPy 3.11 runs as best effort (the profilers
-  degrade to wall-clock).
-- **Checks:** `ruff` (lint + format), `mypy --strict` and `pyright` on the
-  public API, 80% branch coverage, a stdlib-only import test, a
-  dependency-boundary test, and a `compat/` OTLP decode test with test-only deps.
-- **Benchmarks** (`pyperf`, run in a separate `bench/` project like Go's
-  nested `bench` module) cover the noop path, a basic operation, a nested
-  operation, `no_trace`, middleware, and counter `.labels().inc()`.
+- **Matrix:** CPython 3.11, 3.12, 3.13, 3.14, the 3.15 pre-release and
+  free-threaded 3.14t (`PYTHON_GIL=0`) on Linux; 3.14 on macOS and Windows
+  (fork tests and Linux-only detectors skip there). PyPy is not tested.
+- **Checks:** `ruff` (lint + format), `mypy --strict` on `src`, 80% branch
+  coverage (forked children and subprocesses included), a stdlib-only import
+  test, a dependency-boundary test, a lazy-import and import-cost test, a
+  public-API contract test, and the `compat` suite (official OTLP protos and a
+  real grpcio collector) with test-only deps. A wheel check asserts a pure
+  `py3-none-any` wheel with no `Requires-Dist`. `make ci` mirrors the gating
+  jobs; `make matrix` runs every interpreter locally through uv.
+- **Deviations (PLAN decision 41):** there is no `pyright` gate and no
+  separate `bench/` project. In their place, a CI stress job repeats the
+  concurrency-sensitive tests 10 times on 3.14t (`make stress`), unit
+  performance tests in `tests/unit/perf/` pin the fast paths to the reference
+  behaviour, and an e2e test asserts the noop path does not allocate.
 - **Tests** check observable contracts: emitted OTLP bytes, exposition text,
   log JSON. They avoid testing internals and use events and barriers instead of
-  `sleep`.
+  `sleep`. Tests are the contract: implementation changes may not edit them to
+  pass.
 - `CHANGELOG.md` with an *Unreleased* section, plus `CONTRIBUTING.md` and
-  `SECURITY.md` copied from Bedrock's policies. Releases are maintainer-driven
-  tags published to PyPI with trusted publishing, and tags are never moved.
+  `SECURITY.md` adapted from Bedrock's policies. Releases are
+  maintainer-driven tags, and tags are never moved. Publishing to PyPI is
+  manual for now; trusted publishing is planned.
 
 ---
 
-## 21. Open questions
+## 21. Open questions (resolved)
 
-1. **Distribution and import name.** Should it be `pyrock` (the repo name, no
-   conflicts) or `bedrock`, which reads better in code but is ambiguous next to
-   AWS Bedrock SDKs? This doc assumes `pyrock`.
-2. **Thread context default.** Should `init()` optionally patch
-   `threading.Thread` and `ThreadPoolExecutor` to copy context (opt-in
-   `inherit_thread_context=True`)? This trades explicitness for fewer
-   surprises.
-3. **Pre-fork metrics.** Should `{worker}` substitution in `server_addr` be
-   added, or a generic push-gateway mode, or both?
-4. **gRPC `_h2` scope.** Should we keep our own minimal HTTP/2 (this is the
-   real maintenance cost of the zero-dependency rule), or make OTLP/HTTP the
-   only built-in trace transport and let the cloud ingest accept OTLP/HTTP too?
-   Go needed `internal/h2c` only for h2c; in Python TLS h2 is also custom.
-5. **Expected exceptions.** Is `expected=` enough, or do we also want a
-   process-wide `Config.expected_exceptions` (for example, every
-   `HTTPException` with status < 500 counts as success)?
+The questions this design left open were decided during implementation; the
+binding record is `PLAN.md`.
+
+1. **Distribution and import name:** both are `pyrock` (PLAN decision 1).
+2. **Thread context default:** no monkey-patching and no
+   `inherit_thread_context` option. Context crosses threads only through
+   `bind`, `ContextThreadPoolExecutor` and `pyrock.Thread` (decision 2), and
+   the middlewares activate their captured instance per request (decision 18
+   and its amendment for interpreters that inherit context).
+3. **Pre-fork metrics:** the fork hook resets state and restarts background
+   threads; the documented practice is to call `init()` after the fork. There
+   is no `{worker}` substitution and no push-gateway mode in v0 (decision 3).
+4. **gRPC `_h2` scope:** the minimal in-house HTTP/2 client in
+   `trace/otlp/_h2.py` stays, for parity with Go (decision 4).
+5. **Expected exceptions:** per scope only, through `expected=`; there is no
+   process-wide setting (decision 5).
