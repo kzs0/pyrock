@@ -19,7 +19,7 @@ with pyrock.init(service="users-api"):
         do_work()          # an exception escaping here marks the operation as failed
 ```
 
-> **Status:** pre-release (`0.1.0.dev0`). The API follows [DESIGN.md](DESIGN.md);
+> **Status:** alpha (`0.1.0`). The API follows [DESIGN.md](DESIGN.md);
 > minor versions may change behaviour until 1.0, and every change is recorded
 > in [CHANGELOG.md](CHANGELOG.md).
 
@@ -43,8 +43,11 @@ with pyrock.init(service="users-api"):
 ## Install
 
 ```bash
-pip install pyrock
+pip install pyrock-core
 ```
+
+The distribution on PyPI is `pyrock-core`; the package you import is `pyrock`
+(`import pyrock`). The name `pyrock` is taken on PyPI.
 
 - CPython **3.11 or newer**, including the free-threaded build (3.14t, with the
   GIL disabled). Every shared structure is guarded by a lock; nothing relies on

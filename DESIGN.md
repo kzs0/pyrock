@@ -1,6 +1,6 @@
 # pyrock — Bedrock for Python
 
-**Status:** implemented (0.1.0.dev0); where the implementation deviated, this document has been updated and `PLAN.md` records the decision · **Target:** feature parity with `github.com/kzs0/bedrock` · **Dependencies:** none (CPython standard library only)
+**Status:** implemented (0.1.0); where the implementation deviated, this document has been updated and `PLAN.md` records the decision · **Target:** feature parity with `github.com/kzs0/bedrock` · **Dependencies:** none (CPython standard library only)
 
 pyrock is the Python version of Bedrock. It is one opinionated library that
 covers traces, metrics, profiles and structured logs, built around *operations*
@@ -39,7 +39,7 @@ with pyrock.init(service="users-api"):
 3. **Interoperable output:** a Go service and a Python service behind the same
    collector produce the same metric names, label sets, span attributes, log
    shape and env-var configuration. Dashboards and alerts carry over.
-4. **Zero runtime dependencies:** `pip install pyrock` installs one pure-Python
+4. **Zero runtime dependencies:** `pip install pyrock-core` (imported as `pyrock`) installs one pure-Python
    wheel. Optional framework integrations depend only on protocols (WSGI, ASGI,
    `urllib` handlers), never on the frameworks themselves.
 5. **Pythonic:** it should feel like stdlib `logging` plus `contextlib`, not like

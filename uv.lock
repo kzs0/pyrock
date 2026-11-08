@@ -524,7 +524,7 @@ wheels = [
 ]
 
 [[package]]
-name = "pyrock"
+name = "pyrock-core"
 source = { editable = "." }
 
 [package.dev-dependencies]

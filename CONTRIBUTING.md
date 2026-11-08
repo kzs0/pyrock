@@ -98,16 +98,46 @@ commits reviewable; maintainers may squash or rebase when merging.
 
 ## Release process
 
-Releases are maintainer-driven tags. For a release, a maintainer:
+Releases are maintainer-driven tags, published by the `Release` workflow
+(`.github/workflows/release.yml`). For a release, a maintainer:
 
-1. sets the version in `src/pyrock/_version.py` and moves the relevant
-   `Unreleased` entries to a dated `X.Y.Z` section;
-2. verifies `make ci`, `make matrix` and `make compat` on the release commit;
-3. merges the release-ready change to `main`;
-4. creates and pushes a `vX.Y.Z` tag (or a prerelease tag) on that commit;
-5. builds the distribution from the tag (`make build`) and publishes it to
-   PyPI (there is no automated release workflow yet); and
-6. starts a fresh `Unreleased` section.
+1. sets the version in `src/pyrock/_version.py` (`X.Y.Z`, or `X.Y.ZaN`,
+   `X.Y.ZbN` or `X.Y.ZrcN` for a prerelease) and moves the relevant
+   `Unreleased` entries to a dated `## [X.Y.Z] - YYYY-MM-DD` section;
+2. verifies `make ci`, `make matrix` and `make compat` on the release commit
+   (`python3 scripts/release.py check vX.Y.Z` checks the version and
+   changelog locally);
+3. merges the release change to `main`;
+4. creates and pushes the tag `vX.Y.Z` (exactly `v` plus the version) on that
+   commit of `main`:
+
+   ```bash
+   git tag -a v0.1.0 -m "pyrock 0.1.0" <commit-on-main>
+   git push origin v0.1.0
+   ```
+
+5. lets the workflow run. It
+   - checks the tag matches the package version, the changelog has a dated
+     section for it, and the commit is on `main`;
+   - runs the full CI workflow as a gate;
+   - publishes the exact wheel and sdist CI built and checked to PyPI, using
+     trusted publishing (no API token is stored); and
+   - creates the GitHub Release with the changelog section as notes and the
+     distribution files attached, marked as a prerelease for `a`/`b`/`rc`
+     versions; and
+6. starts a fresh `Unreleased` section and a `.dev0` version on `main`.
 
 Release tags must point to `main`. Never move or reuse an existing tag;
-publish a new patch version for corrections.
+publish a new patch version for corrections. A failed run can be re-run: each
+publishing step is safe to repeat once its predecessor succeeded.
+
+### One-time PyPI setup
+
+PyPI trusted publishing has to be configured once, by a maintainer with a PyPI
+account:
+
+1. On PyPI, add a *pending* trusted publisher for the project `pyrock-core`
+   (Account settings → Publishing): owner `kzs0`, repository `pyrock`,
+   workflow `release.yml`, environment `pypi`.
+2. On GitHub, create the `pypi` environment (Settings → Environments). Adding
+   required reviewers there makes every PyPI upload wait for an approval.
