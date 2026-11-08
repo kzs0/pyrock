@@ -136,7 +136,7 @@ publishing step is safe to repeat once its predecessor succeeded.
 PyPI trusted publishing has to be configured once, by a maintainer with a PyPI
 account:
 
-1. On PyPI, add a *pending* trusted publisher for the project `bedrock-py`
+1. On PyPI, add a *pending* trusted publisher for the project `pyrock-core`
    (Account settings → Publishing): owner `kzs0`, repository `pyrock`,
    workflow `release.yml`, environment `pypi`.
 2. On GitHub, create the `pypi` environment (Settings → Environments). Adding

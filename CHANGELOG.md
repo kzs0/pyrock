@@ -16,7 +16,7 @@ The initial release: a zero-dependency Python port of
 [Bedrock](https://github.com/kzs0/bedrock) for CPython 3.11+, including the
 free-threaded build.
 
-Published on PyPI as `bedrock-py` (`pip install bedrock-py`); the import
+Published on PyPI as `pyrock-core` (`pip install pyrock-core`); the import
 package is `pyrock`. The name `pyrock` is taken on PyPI.
 
 ### Added

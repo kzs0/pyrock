@@ -284,8 +284,8 @@ def test_helpers_stay_functions_after_private_modules_load() -> None:
     assert "brk_test_key" not in repr(cfg)
 
 
-# The PyPI distribution is ``bedrock-py``; the import package is ``pyrock``.
-DISTRIBUTION = "bedrock-py"
+# The PyPI distribution is ``pyrock-core``; the import package is ``pyrock``.
+DISTRIBUTION = "pyrock-core"
 
 
 def test_distribution_is_installed_under_its_pypi_name() -> None:
