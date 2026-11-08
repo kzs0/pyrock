@@ -1,6 +1,6 @@
 # pyrock — Bedrock for Python
 
-**Status:** implemented (0.1.0.dev0); where the implementation deviated, this document has been updated and `PLAN.md` records the decision · **Target:** feature parity with `github.com/kzs0/bedrock` · **Dependencies:** none (CPython standard library only)
+**Status:** implemented (0.1.0); where the implementation deviated, this document has been updated and `PLAN.md` records the decision · **Target:** feature parity with `github.com/kzs0/bedrock` · **Dependencies:** none (CPython standard library only)
 
 pyrock is the Python version of Bedrock. It is one opinionated library that
 covers traces, metrics, profiles and structured logs, built around *operations*

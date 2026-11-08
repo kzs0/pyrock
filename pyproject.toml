@@ -14,7 +14,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Kenzo Spaulding" }]
 keywords = ["observability", "tracing", "metrics", "logging", "profiling", "opentelemetry", "prometheus", "otlp"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python",

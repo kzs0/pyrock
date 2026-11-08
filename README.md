@@ -19,7 +19,7 @@ with pyrock.init(service="users-api"):
         do_work()          # an exception escaping here marks the operation as failed
 ```
 
-> **Status:** pre-release (`0.1.0.dev0`). The API follows [DESIGN.md](DESIGN.md);
+> **Status:** alpha (`0.1.0`). The API follows [DESIGN.md](DESIGN.md);
 > minor versions may change behaviour until 1.0, and every change is recorded
 > in [CHANGELOG.md](CHANGELOG.md).
 
